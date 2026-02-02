@@ -296,14 +296,12 @@ class ChatWindow(QWidget):
                 self.contact_avatars[contact_login] = pixmap
                 return pixmap
 
-        # Возвращаем дефолтную аватарку если нет своей
         default_avatar_path = self.script_dir / "images" / "default_avatar.jpg"
         if os.path.exists(default_avatar_path):
             default_pixmap = QPixmap(str(default_avatar_path))
             self.contact_avatars[contact_login] = default_pixmap
             return default_pixmap
 
-        # Создаем пустую аватарку
         default_pixmap = QPixmap(60, 60)
         default_pixmap.fill(QColor("#cccccc"))
         self.contact_avatars[contact_login] = default_pixmap
