@@ -14,62 +14,47 @@ from jinja2 import Template
 
 from styles import (style_input_field, style_chat_list, style_message_area1, style_mesg,
                     style_round_btn, style_tool_button, style_menu, style_hi_label, defult_ava)
-from network import make_server_request
+from network import make_server_request, messenger_api
 from network import Contact
 import markdown
 import base64
 import html
 
 
-class SearchDialog(QDialog):
+class AddContactDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Поиск пользователей")
-        self.setFixedSize(400, 500)
+        self.setWindowTitle("Добавить контакт")
+        self.setFixedSize(245, 140)
 
         layout = QVBoxLayout(self)
 
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Введите имя или логин пользователя...")
-        self.search_input.setStyleSheet(style_input_field)
-        self.search_input.textChanged.connect(self.on_search_changed)
-
-        self.results_list = QListWidget()
-        self.results_list.setStyleSheet(style_chat_list)
-        self.results_list.itemClicked.connect(self.on_user_selected)
+        self.login_label = QLabel("Введите логин пользователя:")
+        self.login_input = QLineEdit()
+        self.login_input.setPlaceholderText("Логин")
+        self.login_input.setStyleSheet(style_input_field)
 
         button_layout = QHBoxLayout()
         self.cancel_button = QPushButton("Отмена")
         self.cancel_button.clicked.connect(self.reject)
         self.cancel_button.setStyleSheet(style_round_btn)
 
-        self.add_button = QPushButton("Добавить выбранного")
+        self.add_button = QPushButton("Добавить")
         self.add_button.clicked.connect(self.accept)
         self.add_button.setStyleSheet(style_round_btn)
-        self.add_button.setEnabled(False)
+        self.add_button.setEnabled(True)
 
         button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
         button_layout.addWidget(self.add_button)
 
-        layout.addWidget(QLabel("Поиск пользователей:"))
-        layout.addWidget(self.search_input)
-        layout.addWidget(self.results_list)
+
+        layout.addWidget(self.login_label)
+        layout.addWidget(self.login_input)
         layout.addLayout(button_layout)
 
-        self.selected_user = None
-
-    def on_search_changed(self, text):
-        if text.strip():
-            self.parent().search_users(text.strip(), self)
-        else:
-            self.results_list.clear()
-
-    def on_user_selected(self, item):
-        self.selected_user = item.data(Qt.ItemDataRole.UserRole)
-        self.add_button.setEnabled(bool(self.selected_user))
-
-    def get_selected_user(self):
-        return self.selected_user
+    def get_login(self):
+        return self.login_input.text().strip()
 
 
 class AutoResizeTextEdit(QTextEdit):
@@ -311,33 +296,18 @@ class ChatWindow(QWidget):
                 self.contact_avatars[contact_login] = pixmap
                 return pixmap
 
-    def search_users(self, search_query, dialog=None):
-        response = make_server_request('search_users', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'search_query': search_query
-        })
+        # Возвращаем дефолтную аватарку если нет своей
+        default_avatar_path = self.script_dir / "images" / "default_avatar.jpg"
+        if os.path.exists(default_avatar_path):
+            default_pixmap = QPixmap(str(default_avatar_path))
+            self.contact_avatars[contact_login] = default_pixmap
+            return default_pixmap
 
-        if dialog and response and response.get('success'):
-            dialog.results_list.clear()
-            users = response.get('users', [])
-            for user in users:
-                item = QListWidgetItem(f"{user['username']} ({user['login']})")
-                item.setData(Qt.ItemDataRole.UserRole, user)
-                dialog.results_list.addItem(item)
-
-            if not users:
-                dialog.results_list.addItem("Пользователи не найдены")
-
-    def get_user_info(self, login):
-        response = make_server_request('get_user_info', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'target_login': login
-        })
-
-        if response and response.get('success'):
-            return response.get('user')
+        # Создаем пустую аватарку
+        default_pixmap = QPixmap(60, 60)
+        default_pixmap.fill(QColor("#cccccc"))
+        self.contact_avatars[contact_login] = default_pixmap
+        return default_pixmap
 
     def search_contacts(self, search_text):
         search_text = search_text.strip().lower()
@@ -397,23 +367,9 @@ class ChatWindow(QWidget):
         if response and response.get('success'):
             messages = response.get('messages', [])
             template_path = self.script_dir / "chats" / "messages.html"
-            if os.path.exists(template_path):
-                with open(template_path, 'r', encoding='utf-8') as f:
-                    template_content = f.read()
-                    template = Template(template_content)
-            else:
-                template = Template("""
-                <html>
-                <body>
-                {% for message in messages %}
-                    <div style="margin: 10px; padding: 10px; background-color: {% if message.sender_login == current_user %}#e6f7ff{% else %}#f0f0f0{% endif %}; border-radius: 10px;">
-                        <strong>{{ message.sender_login }}</strong>: {{ message.message_text|safe }}
-                    </div>
-                {% endfor %}
-                </body>
-                </html>
-                """)
-
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template_content = f.read()
+                template = Template(template_content)
             for elem in messages:
                 elem['message_text'] = markdown.markdown(html.escape(elem['message_text']),
                                                          extensions=['nl2br', 'tables'])
@@ -427,11 +383,11 @@ class ChatWindow(QWidget):
             self.prev_template = rendered_template
 
     def add_contact_dialog(self):
-        dialog = SearchDialog(self)
+        dialog = AddContactDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            user = dialog.get_selected_user()
-            if user:
-                self.add_contact_by_login(user['login'])
+            login = dialog.get_login()
+            if login:
+                self.add_contact_by_login(login)
 
     def add_contact_by_login(self, contact_login):
         if not contact_login:
@@ -446,11 +402,6 @@ class ChatWindow(QWidget):
             QMessageBox.information(self, "Информация", "Этот контакт уже добавлен!")
             return
 
-        user_info = self.get_user_info(contact_login)
-        if not user_info:
-            QMessageBox.warning(self, "Ошибка", "Пользователь не найден!")
-            return
-
         response = make_server_request('add_contact', {
             'user_token': self.main_window.user_token,
             'user_id': self.main_window.user_id,
@@ -459,12 +410,30 @@ class ChatWindow(QWidget):
 
         if response:
             if response.get('success'):
+                search_response = make_server_request('search_users', {
+                    'user_token': self.main_window.user_token,
+                    'user_id': self.main_window.user_id,
+                    'search_query': contact_login
+                })
+
+                username = contact_login
+                if search_response and search_response.get('success'):
+                    users = search_response.get('users', [])
+                    for user in users:
+                        if user['login'] == contact_login:
+                            username = user['username']
+                            break
+
                 new_contact = Contact(
                     login=contact_login,
-                    username=user_info['username'])
+                    username=username
+                )
                 self.contacts[contact_login] = new_contact
                 self.update_contacts_list()
-                QMessageBox.information(self, "Успех", f"Контакт '{user_info['username']}' добавлен!")
+                QMessageBox.information(self, "Успех", f"Контакт '{username}' добавлен!")
+            else:
+                error_msg = response.get('error', 'Неизвестная ошибка')
+                QMessageBox.warning(self, "Ошибка", f"Ошибка при добавлении контакта: {error_msg}")
         else:
             QMessageBox.warning(self, "Ошибка", "Ошибка соединения с сервером!")
 
