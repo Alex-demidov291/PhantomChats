@@ -53,7 +53,7 @@ def izmenit_parol(parol, stariy_hesh):
 
 class SocketClient:
 
-    def __init__(self, host='localhost', port=5000):
+    def __init__(self, host='5.35.80.248', port=5000):
         self.host = host
         self.port = port
         self.soket = None
@@ -101,7 +101,7 @@ class SocketClient:
 
 class MessengerAPI:
 
-    def __init__(self, host='localhost', port=5000):
+    def __init__(self, host='5.35.80.248', port=5000):
         self.klient = SocketClient(host, port)
 
     def registraciya(self, login, parol, username):
@@ -199,7 +199,7 @@ class MessengerAPI:
         self.klient.razsoedinenie()
 
 
-messenger_api = MessengerAPI(host='localhost', port=5000)
+messenger_api = MessengerAPI(host='5.35.80.248', port=5000)
 
 
 def make_server_request(endpoint, data=None, method='POST'):

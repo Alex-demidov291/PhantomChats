@@ -9,9 +9,9 @@ import hashlib
 import base64
 from pathlib import Path
 
-SERVER_HOST = '0.0.0.0'
+SERVER_HOST = '5.35.80.248'
 SERVER_PORT = 5000
-MAX_CONNECTIONS = 100
+MAX_CONNECTIONS = 10000
 BUFFER_SIZE = 4096
 active_connections = {}
 
