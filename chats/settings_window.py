@@ -1,16 +1,192 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                             QLineEdit, QFileDialog, QMessageBox)
+                             QLineEdit, QFileDialog, QMessageBox, QDialog, QListWidget,
+                             QListWidgetItem, QDialogButtonBox, QComboBox)
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtCore import QSize, Qt
 import sys
 import os
 import tempfile
 import base64
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from styles import (style_round_btn, style_reg_button, style_login_button, style_red_button,
                     style_input_field, defult_ava, angle_alf, numbers)
 from network import make_server_request
+
+
+class CleanupSettingsDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("Настройка очистки сессий")
+        self.setFixedSize(400, 250)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel("Выберите интервал автоматической очистки завершенных сессий:")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        self.interval_combo = QComboBox()
+        self.interval_combo.addItem("Немедленно", 0)
+        self.interval_combo.addItem("Каждый день (24 часа)", 86400)
+        self.interval_combo.addItem("Каждые 3 дня", 259200)
+        self.interval_combo.addItem("Каждую неделю", 604800)
+        self.interval_combo.addItem("Каждые 2 недели", 1209600)
+        self.interval_combo.addItem("Каждый месяц (30 дней)", 2592000)
+        layout.addWidget(self.interval_combo)
+
+        self.load_current_interval()
+
+        buttons_layout = QHBoxLayout()
+
+        save_button = QPushButton("Сохранить")
+        save_button.setStyleSheet(style_reg_button)
+        save_button.clicked.connect(self.save_settings)
+
+        cancel_button = QPushButton("Отмена")
+        cancel_button.setStyleSheet(style_red_button)
+        cancel_button.clicked.connect(self.reject)
+
+        buttons_layout.addWidget(save_button)
+        buttons_layout.addWidget(cancel_button)
+        layout.addLayout(buttons_layout)
+
+    def load_current_interval(self):
+        response = make_server_request('get_cleanup_interval', {
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id
+        })
+
+        if response and response.get('success'):
+            interval = response.get('cleanup_interval', 0)
+
+            for i in range(self.interval_combo.count()):
+                if self.interval_combo.itemData(i) == interval:
+                    self.interval_combo.setCurrentIndex(i)
+                    break
+
+    def save_settings(self):
+        interval = self.interval_combo.currentData()
+
+        response = make_server_request('set_cleanup_interval', {
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id,
+            'interval': interval
+        })
+
+        if response and response.get('success'):
+            QMessageBox.information(self, "Успех", "Настройки очистки сохранены")
+            self.accept()
+        else:
+            error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
+            QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить настройки: {error_msg}")
+
+
+class SessionsDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("Управление сессиями")
+        self.setFixedSize(500, 400)
+
+        layout = QVBoxLayout(self)
+
+        self.sessions_list = QListWidget()
+        layout.addWidget(self.sessions_list)
+
+        buttons_layout = QHBoxLayout()
+
+        self.refresh_button = QPushButton("Обновить")
+        self.refresh_button.setStyleSheet(style_reg_button)
+        self.refresh_button.clicked.connect(self.load_sessions)
+
+        self.logout_button = QPushButton("Выкл. выбранную")
+        self.logout_button.setStyleSheet(style_red_button)
+        self.logout_button.clicked.connect(self.logout_selected_session)
+
+        self.logout_all_button = QPushButton("Выгнать всех")
+        self.logout_all_button.setStyleSheet(style_red_button)
+        self.logout_all_button.clicked.connect(self.logout_all_sessions)
+
+        buttons_layout.addWidget(self.refresh_button)
+        buttons_layout.addWidget(self.logout_button)
+        buttons_layout.addWidget(self.logout_all_button)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box.rejected.connect(self.reject)
+
+        layout.addLayout(buttons_layout)
+        layout.addWidget(button_box)
+
+        self.load_sessions()
+
+    def load_sessions(self):
+        response = make_server_request('get_sessions', {
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id
+        })
+
+        self.sessions_list.clear()
+
+        if response and response.get('success'):
+            sessions = response.get('sessions', [])
+            for session in sessions:
+                session_id_short = session['session_id'][:8] + '...'
+                created = session['created_at'][:19]
+                last_used = session['last_used_at'][:19]
+                status = "✓ Текущая" if session['is_current'] else ("Активна" if session['is_active'] else "Неактивна")
+
+                item_text = f"{session_id_short} | Создана: {created} | Последняя активность: {last_used} | {status}"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.ItemDataRole.UserRole, session['session_id'])
+
+                if session['is_current']:
+                    item.setBackground(Qt.GlobalColor.green)
+                    item.setForeground(Qt.GlobalColor.white)
+                elif not session['is_active']:
+                    item.setForeground(Qt.GlobalColor.gray)
+
+                self.sessions_list.addItem(item)
+
+    def logout_selected_session(self):
+        selected_items = self.sessions_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Ошибка", "Выберите сессию для завершения")
+            return
+
+        item = selected_items[0]
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+
+        response = make_server_request('logout_session', {
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id,
+            'target_session_id': session_id
+        })
+
+        if response and response.get('success'):
+            QMessageBox.information(self, "Успех", "Сессия завершена")
+            self.load_sessions()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Не удалось завершить сессию")
+
+    def logout_all_sessions(self):
+        reply = QMessageBox.question(self, "Подтверждение",
+                                     "Завершить все сессии кроме текущей?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            response = make_server_request('logout_all_sessions', {
+                'user_token': self.main_window.user_token,
+                'user_id': self.main_window.user_id
+            })
+
+            if response and response.get('success'):
+                QMessageBox.information(self, "Успех", "Все другие сессии завершены")
+                self.load_sessions()
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось завершить сессии")
 
 
 class SettingsWindow(QWidget):
@@ -96,6 +272,19 @@ class SettingsWindow(QWidget):
         password_layout.addLayout(password_input_layout)
         main_layout.addLayout(password_layout)
 
+        sessions_btn = QPushButton("Управление сессиями")
+        sessions_btn.setStyleSheet(style_round_btn)
+        sessions_btn.clicked.connect(self.show_sessions_dialog)
+
+        cleanup_btn = QPushButton("Настройка очистки сессий")
+        cleanup_btn.setStyleSheet(style_round_btn)
+        cleanup_btn.clicked.connect(self.show_cleanup_dialog)
+
+        sessions_layout = QHBoxLayout()
+        sessions_layout.addWidget(sessions_btn)
+        sessions_layout.addWidget(cleanup_btn)
+        main_layout.addLayout(sessions_layout)
+
         back_chat_btn = QPushButton("Вернуться в чат")
         back_chat_btn.setStyleSheet(style_login_button)
         main_layout.addWidget(back_chat_btn)
@@ -120,6 +309,14 @@ class SettingsWindow(QWidget):
         except Exception as e:
             print(f"Error saving temp avatar: {e}")
             return defult_ava
+
+    def show_sessions_dialog(self):
+        dialog = SessionsDialog(self.main_window, self)
+        dialog.exec()
+
+    def show_cleanup_dialog(self):
+        dialog = CleanupSettingsDialog(self.main_window, self)
+        dialog.exec()
 
     def change_name(self):
         new_name = self.name_edit.text().strip()
@@ -181,7 +378,7 @@ class SettingsWindow(QWidget):
 
                 os.remove(temp_path)
 
-                if len(image_data) > 1000000:  # 1MB
+                if len(image_data) > 1000000:
                     QMessageBox.warning(self, "Ошибка",
                                         "Изображение слишком большое. Выберите файл поменьше.")
                     return

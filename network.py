@@ -103,6 +103,10 @@ class MessengerAPI:
 
     def __init__(self, host='5.35.80.248', port=5000):
         self.klient = SocketClient(host, port)
+        self.session_token = None
+
+    def set_session_token(self, session_token):
+        self.session_token = session_token
 
     def registraciya(self, login, parol, username):
         parol_heshirovanniy = hesir_parol(parol)
@@ -113,31 +117,99 @@ class MessengerAPI:
         })
 
     def vhod(self, login, parol):
-        return self.klient.otpravka('login', {
+        result = self.klient.otpravka('login', {
             'login': login,
             'password': parol
         })
+        if result and result.get('success'):
+            self.session_token = result.get('session_token')
+        return result
 
-    def info(self, token, id_user):
-        return self.klient.otpravka('info', {
+    def logout_current(self, token, id_user):
+        dannie = {
             'user_token': token,
             'user_id': id_user
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('logout_current', dannie)
+
+    def info(self, token, id_user):
+        dannie = {
+            'user_token': token,
+            'user_id': id_user
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('info', dannie)
+
+    def poluchit_sessii(self, token, id_user):
+        dannie = {
+            'user_token': token,
+            'user_id': id_user
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('get_sessions', dannie)
+
+    def vyyti_iz_sessii(self, token, id_user, target_session_id):
+        dannie = {
+            'user_token': token,
+            'user_id': id_user,
+            'target_session_id': target_session_id
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('logout_session', dannie)
+
+    def vyyti_iz_vseh_sessiy(self, token, id_user):
+        dannie = {
+            'user_token': token,
+            'user_id': id_user
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('logout_all_sessions', dannie)
+
+    def poluchit_cleanup_interval(self, token, id_user):
+        dannie = {
+            'user_token': token,
+            'user_id': id_user
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('get_cleanup_interval', dannie)
+
+    def ustanovit_cleanup_interval(self, token, id_user, interval):
+        dannie = {
+            'user_token': token,
+            'user_id': id_user,
+            'interval': interval
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('set_cleanup_interval', dannie)
 
     def otpravit_soobschenie(self, token, id_user, poluchatel_login, text):
-        return self.klient.otpravka('send_message', {
+        dannie = {
             'user_token': token,
             'user_id': id_user,
             'receiver_login': poluchatel_login,
             'text': text
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('send_message', dannie)
 
     def poluchit_soobscheniya(self, token, id_user, drugoi_user_login):
-        return self.klient.otpravka('get_messages', {
+        dannie = {
             'user_token': token,
             'user_id': id_user,
             'other_user_login': drugoi_user_login
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('get_messages', dannie)
 
     def obnovit_profil(self, token, id_user, username=None, avatar=None, parol=None):
         dannie = {
@@ -152,48 +224,69 @@ class MessengerAPI:
         if parol:
             dannie['password'] = hesir_parol(parol)
 
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+
         return self.klient.otpravka('update_profile', dannie)
 
     def dobavit_kontakt(self, token, id_user, kontakt_login):
-        return self.klient.otpravka('add_contact', {
+        dannie = {
             'user_token': token,
             'user_id': id_user,
             'contact_login': kontakt_login
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('add_contact', dannie)
 
     def poluchit_kontakti(self, token, id_user):
-        return self.klient.otpravka('get_contacts', {
+        dannie = {
             'user_token': token,
             'user_id': id_user
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('get_contacts', dannie)
 
     def poluchit_avatar(self, token, id_user, kontakt_login):
-        return self.klient.otpravka('get_avatar', {
+        dannie = {
             'user_token': token,
             'user_id': id_user,
             'contact_login': kontakt_login
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('get_avatar', dannie)
 
     def sohranit_nastroyki_kontakta(self, token, id_user, kontakt_login, imya_dlya_otobrajeniya):
-        return self.klient.otpravka('save_contact_settings', {
+        dannie = {
             'user_token': token,
             'user_id': id_user,
             'contact_login': kontakt_login,
             'display_name': imya_dlya_otobrajeniya
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('save_contact_settings', dannie)
 
     def poluchit_nastroyki_kontakta(self, token, id_user):
-        return self.klient.otpravka('get_contact_settings', {
+        dannie = {
             'user_token': token,
             'user_id': id_user
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('get_contact_settings', dannie)
 
     def udalit_kontakt(self, token, id_user, kontakt_login):
-        return self.klient.otpravka('remove_contact', {
+        dannie = {
             'user_token': token,
             'user_id': id_user,
             'contact_login': kontakt_login
-        })
+        }
+        if self.session_token:
+            dannie['session_token'] = self.session_token
+        return self.klient.otpravka('remove_contact', dannie)
 
     def razsoedinenie(self):
         self.klient.razsoedinenie()
@@ -218,17 +311,71 @@ def make_server_request(endpoint, data=None, method='POST'):
         'get_avatar': 'get_avatar',
         'save_contact_settings': 'save_contact_settings',
         'get_contact_settings': 'get_contact_settings',
-        'remove_contact': 'remove_contact'
+        'remove_contact': 'remove_contact',
+        'get_sessions': 'get_sessions',
+        'logout_session': 'logout_session',
+        'logout_all_sessions': 'logout_all_sessions',
+        'logout_current': 'logout_current',
+        'get_cleanup_interval': 'get_cleanup_interval',
+        'set_cleanup_interval': 'set_cleanup_interval'
     }
 
     noviy_punkt = sootvetstvie.get(endpoint)
 
     if noviy_punkt == 'info':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.info(
             token=data.get('user_token'),
             id_user=data.get('user_id')
         )
+    elif noviy_punkt == 'get_sessions':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
+        return messenger_api.poluchit_sessii(
+            token=data.get('user_token'),
+            id_user=data.get('user_id')
+        )
+    elif noviy_punkt == 'logout_session':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
+        return messenger_api.vyyti_iz_sessii(
+            token=data.get('user_token'),
+            id_user=data.get('user_id'),
+            target_session_id=data.get('target_session_id')
+        )
+    elif noviy_punkt == 'logout_all_sessions':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
+        return messenger_api.vyyti_iz_vseh_sessiy(
+            token=data.get('user_token'),
+            id_user=data.get('user_id')
+        )
+    elif noviy_punkt == 'logout_current':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
+        return messenger_api.logout_current(
+            token=data.get('user_token'),
+            id_user=data.get('user_id')
+        )
+    elif noviy_punkt == 'get_cleanup_interval':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
+        return messenger_api.poluchit_cleanup_interval(
+            token=data.get('user_token'),
+            id_user=data.get('user_id')
+        )
+    elif noviy_punkt == 'set_cleanup_interval':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
+        return messenger_api.ustanovit_cleanup_interval(
+            token=data.get('user_token'),
+            id_user=data.get('user_id'),
+            interval=data.get('interval')
+        )
     elif noviy_punkt == 'send_message':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.otpravit_soobschenie(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
@@ -236,12 +383,16 @@ def make_server_request(endpoint, data=None, method='POST'):
             text=data.get('text')
         )
     elif noviy_punkt == 'get_messages':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.poluchit_soobscheniya(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
             drugoi_user_login=data.get('other_user_login')
         )
     elif noviy_punkt == 'update_profile':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.obnovit_profil(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
@@ -250,23 +401,31 @@ def make_server_request(endpoint, data=None, method='POST'):
             parol=data.get('password')
         )
     elif noviy_punkt == 'add_contact':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.dobavit_kontakt(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
             kontakt_login=data.get('contact_login')
         )
     elif noviy_punkt == 'get_contacts':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.poluchit_kontakti(
             token=data.get('user_token'),
             id_user=data.get('user_id')
         )
     elif noviy_punkt == 'get_avatar':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.poluchit_avatar(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
             kontakt_login=data.get('contact_login')
         )
     elif noviy_punkt == 'save_contact_settings':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.sohranit_nastroyki_kontakta(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
@@ -274,21 +433,29 @@ def make_server_request(endpoint, data=None, method='POST'):
             imya_dlya_otobrajeniya=data.get('display_name')
         )
     elif noviy_punkt == 'get_contact_settings':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.poluchit_nastroyki_kontakta(
             token=data.get('user_token'),
             id_user=data.get('user_id')
         )
     elif noviy_punkt == 'remove_contact':
+        if 'session_token' in data:
+            messenger_api.set_session_token(data['session_token'])
         return messenger_api.udalit_kontakt(
             token=data.get('user_token'),
             id_user=data.get('user_id'),
             kontakt_login=data.get('contact_login')
         )
     elif noviy_punkt == 'login':
-        return messenger_api.vhod(
+        result = messenger_api.vhod(
             login=data.get('login'),
             parol=data.get('password')
         )
+        if result and result.get('success'):
+            if 'session_token' in result:
+                messenger_api.set_session_token(result['session_token'])
+        return result
     elif noviy_punkt == 'register':
         return messenger_api.registraciya(
             login=data.get('login'),

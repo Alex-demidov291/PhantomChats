@@ -8,6 +8,9 @@ import os
 import hashlib
 import base64
 from pathlib import Path
+import secrets
+import time
+from threading import Timer
 
 SERVER_HOST = '5.35.80.248'
 SERVER_PORT = 5000
@@ -15,9 +18,57 @@ MAX_CONNECTIONS = 10000
 BUFFER_SIZE = 4096
 active_connections = {}
 
-# создаем папку для аватарок если ее нет
 AVATARS_DIR = Path('avatars')
 AVATARS_DIR.mkdir(exist_ok=True)
+
+CLEANUP_INTERVAL = 86400
+
+session_cleanup_timer = None
+
+
+def start_session_cleanup_timer(interval=CLEANUP_INTERVAL):
+    global session_cleanup_timer
+    if session_cleanup_timer:
+        session_cleanup_timer.cancel()
+
+    def cleanup_job():
+        cleanup_expired_sessions()
+        start_session_cleanup_timer(interval)
+
+    session_cleanup_timer = Timer(interval, cleanup_job)
+    session_cleanup_timer.daemon = True
+    session_cleanup_timer.start()
+
+
+def cleanup_expired_sessions():
+    conn = sqlite3.connect('messenger.db', check_same_thread=False)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        select distinct user_id from cleanup_settings where cleanup_interval = 0
+    ''')
+    users_immediate = [row[0] for row in cursor.fetchall()]
+
+    for user_id in users_immediate:
+        cursor.execute('''
+            delete from user_sessions 
+            where user_id = ? and is_active = 0
+        ''', (user_id,))
+
+    cursor.execute('''
+        select distinct user_id, cleanup_interval from cleanup_settings where cleanup_interval > 0
+    ''')
+    users_with_interval = cursor.fetchall()
+
+    for user_id, interval in users_with_interval:
+        cutoff_time = datetime.datetime.now() - datetime.timedelta(seconds=interval)
+        cursor.execute('''
+            delete from user_sessions 
+            where user_id = ? and is_active = 0 and last_used_at < ?
+        ''', (user_id, cutoff_time))
+
+    conn.commit()
+    conn.close()
 
 
 def verify_password(password, stored_hash):
@@ -56,7 +107,6 @@ def migrate_password_in_database(db, login, password):
     return stored_password
 
 
-# работа с базой данных
 class Database:
     def __init__(self, db_path='messenger.db'):
         self.db_path = db_path
@@ -112,19 +162,218 @@ class Database:
                 unique(user_login, contact_login)
             )
         ''')
+        cursor.execute('''
+            create table if not exists user_sessions (
+                session_id text primary key,
+                user_id integer not null,
+                user_login text not null,
+                session_token_hash text not null,
+                created_at datetime default current_timestamp,
+                last_used_at datetime default current_timestamp,
+                is_active integer default 1,
+                foreign key (user_id) references users(user_id),
+                foreign key (user_login) references users(login)
+            )
+        ''')
+        cursor.execute('''
+            create table if not exists cleanup_settings (
+                user_id integer primary key,
+                cleanup_interval integer default 0,
+                foreign key (user_id) references users(user_id)
+            )
+        ''')
         conn.commit()
         conn.close()
 
     def get_user_by_token(self, user_token, user_id):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('select * from users where user_token = ? and user_id = ?',
-                       (user_token, user_id))
+
+        cursor.execute('''
+            select u.* from users u
+            join user_sessions s on u.user_id = s.user_id
+            where s.session_id = ? and u.user_id = ? and s.is_active = 1
+        ''', (user_token, user_id))
+
         user = cursor.fetchone()
         conn.close()
         if user:
             return dict(user)
         return None
+
+    def get_user_by_session_token(self, session_token, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        session_token_hash = hashlib.sha256(session_token.encode()).hexdigest()
+
+        cursor.execute('''
+            select u.* from users u
+            join user_sessions s on u.user_id = s.user_id
+            where s.session_token_hash = ? and u.user_id = ? and s.is_active = 1
+        ''', (session_token_hash, user_id))
+
+        user = cursor.fetchone()
+        conn.close()
+        if user:
+            return dict(user)
+        return None
+
+    def get_user_sessions(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            select session_id, created_at, last_used_at, is_active
+            from user_sessions
+            where user_id = ?
+            order by last_used_at desc
+        ''', (user_id,))
+        sessions = cursor.fetchall()
+        conn.close()
+        if sessions:
+            return [dict(session) for session in sessions]
+        return []
+
+    def create_user_session(self, user_id, user_login, session_id, session_token):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        session_token_hash = hashlib.sha256(session_token.encode()).hexdigest()
+
+        cursor.execute('''
+            insert into user_sessions (session_id, user_id, user_login, session_token_hash)
+            values (?, ?, ?, ?)
+        ''', (session_id, user_id, user_login, session_token_hash))
+
+        cursor.execute('''
+            select cleanup_interval from cleanup_settings where user_id = ?
+        ''', (user_id,))
+        cleanup_result = cursor.fetchone()
+
+        if cleanup_result and cleanup_result[0] == 0:
+            cursor.execute('''
+                delete from user_sessions 
+                where user_id = ? and is_active = 0
+            ''', (user_id,))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def update_session_last_used(self, session_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            update user_sessions
+            set last_used_at = datetime('now')
+            where session_id = ?
+        ''', (session_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_session(self, session_id, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            update user_sessions
+            set is_active = 0
+            where session_id = ? and user_id = ?
+        ''', (session_id, user_id))
+
+        cursor.execute('''
+            select cleanup_interval from cleanup_settings where user_id = ?
+        ''', (user_id,))
+        cleanup_result = cursor.fetchone()
+
+        if cleanup_result and cleanup_result[0] == 0:
+            cursor.execute('''
+                delete from user_sessions 
+                where user_id = ? and is_active = 0
+            ''', (user_id,))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_all_sessions_except(self, user_id, except_session_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            update user_sessions
+            set is_active = 0
+            where user_id = ? and session_id != ?
+        ''', (user_id, except_session_id))
+
+        cursor.execute('''
+            select cleanup_interval from cleanup_settings where user_id = ?
+        ''', (user_id,))
+        cleanup_result = cursor.fetchone()
+
+        if cleanup_result and cleanup_result[0] == 0:
+            cursor.execute('''
+                delete from user_sessions 
+                where user_id = ? and is_active = 0
+            ''', (user_id,))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_all_sessions(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            update user_sessions
+            set is_active = 0
+            where user_id = ?
+        ''', (user_id,))
+
+        cursor.execute('''
+            select cleanup_interval from cleanup_settings where user_id = ?
+        ''', (user_id,))
+        cleanup_result = cursor.fetchone()
+
+        if cleanup_result and cleanup_result[0] == 0:
+            cursor.execute('''
+                delete from user_sessions 
+                where user_id = ? and is_active = 0
+            ''', (user_id,))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def get_cleanup_interval(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            select cleanup_interval from cleanup_settings where user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            return result[0]
+        return 0
+
+    def set_cleanup_interval(self, user_id, interval):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            insert or replace into cleanup_settings (user_id, cleanup_interval)
+            values (?, ?)
+        ''', (user_id, interval))
+
+        if interval == 0:
+            cursor.execute('''
+                delete from user_sessions 
+                where user_id = ? and is_active = 0
+            ''', (user_id,))
+            print(f"[*] Немедленная очистка завершенных сессий для пользователя {user_id}")
+
+        conn.commit()
+        conn.close()
+        return True
 
     def execute_query(self, query, params=()):
         conn = self.get_connection()
@@ -146,7 +395,6 @@ class Database:
         return True
 
 
-# обработка запросов
 class RequestHandler:
     def __init__(self):
         self.db = Database()
@@ -191,6 +439,7 @@ class RequestHandler:
         '''
 
         if self.db.execute_update(query, (login, password, username, user_token, user_id)):
+            self.db.set_cleanup_interval(user_id, 0)
             return {
                 'success': True,
                 'user_token': user_token,
@@ -215,22 +464,53 @@ class RequestHandler:
                 new_password_hash = migrate_password_in_database(self.db, login, password)
                 print(f"Пароль пользователя {login} мигрирован к новому формату")
 
+            session_id = str(uuid.uuid4())
+            session_token = secrets.token_urlsafe(64)
+
+            self.db.create_user_session(user['user_id'], user['login'], session_id, session_token)
+
             return {
                 'success': True,
-                'user_token': user['user_token'],
+                'user_token': session_id,
+                'session_token': session_token,
                 'user_id': user['user_id'],
                 'username': user['username']
             }
         else:
             return {'success': False, 'error': 'Неверный логин или пароль'}
 
+    def handle_logout_current(self, data):
+        user_token = data.get('user_token')
+        user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
+
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        self.db.deactivate_session(user_token, user_id)
+
+        return {'success': True}
+
     def handle_info(self, data):
         user_token = data.get('user_token')
         user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        if user_token and session_token:
+            self.db.update_session_last_used(user_token)
 
         return {
             'success': True,
@@ -239,12 +519,126 @@ class RequestHandler:
             'avatar': user['avatar'] if user['avatar'] else None,
         }
 
+    def handle_get_sessions(self, data):
+        user_token = data.get('user_token')
+        user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
+
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        sessions = self.db.get_user_sessions(user_id)
+
+        formatted_sessions = []
+        for session in sessions:
+            formatted_sessions.append({
+                'session_id': session['session_id'],
+                'created_at': session['created_at'],
+                'last_used_at': session['last_used_at'],
+                'is_active': bool(session['is_active']),
+                'is_current': session['session_id'] == user_token
+            })
+
+        return {
+            'success': True,
+            'sessions': formatted_sessions
+        }
+
+    def handle_logout_session(self, data):
+        user_token = data.get('user_token')
+        user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
+        target_session_id = data.get('target_session_id')
+
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        if not target_session_id:
+            return {'success': False, 'error': 'Не указана сессия для выхода'}
+
+        self.db.deactivate_session(target_session_id, user_id)
+
+        return {'success': True}
+
+    def handle_logout_all_sessions(self, data):
+        user_token = data.get('user_token')
+        user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
+
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        self.db.deactivate_all_sessions_except(user_id, user_token)
+
+        return {'success': True}
+
+    def handle_get_cleanup_interval(self, data):
+        user_token = data.get('user_token')
+        user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
+
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        interval = self.db.get_cleanup_interval(user_id)
+
+        return {
+            'success': True,
+            'cleanup_interval': interval
+        }
+
+    def handle_set_cleanup_interval(self, data):
+        user_token = data.get('user_token')
+        user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
+        interval = data.get('interval')
+
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
+        if interval < 0:
+            return {'success': False, 'error': 'Интервал не может быть отрицательным'}
+
+        self.db.set_cleanup_interval(user_id, interval)
+
+        return {'success': True}
+
     def handle_search_users(self, data):
         user_token = data.get('user_token')
         user_id = data.get('user_id')
         search_query = data.get('search_query', '').strip()
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
@@ -270,8 +664,13 @@ class RequestHandler:
         user_token = data.get('user_token')
         user_id = data.get('user_id')
         target_login = data.get('target_login')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
@@ -309,8 +708,15 @@ class RequestHandler:
         user_id = data.get('user_id')
         receiver_login = data.get('receiver_login')
         text = data.get('text')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
         query = '''
             insert into messages (sender_login, receiver_login, message_text)
@@ -326,8 +732,15 @@ class RequestHandler:
         user_token = data.get('user_token')
         user_id = data.get('user_id')
         other_user_login = data.get('other_user_login')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
         query = '''
             select m.*, u.username as sender_name
@@ -354,8 +767,13 @@ class RequestHandler:
         username = data.get('username')
         avatar = data.get('avatar')
         password = data.get('password')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
@@ -382,12 +800,15 @@ class RequestHandler:
             updates.append('password = ?')
             params.append(password)
 
+            if not username and not avatar:
+                self.db.deactivate_all_sessions_except(user_id, user_token)
+
         if updates:
-            params.extend([user_token, user_id])
+            params.extend([user['login']])
             query = f'''
                 update users 
                 set {', '.join(updates)} 
-                where user_token = ? and user_id = ?
+                where login = ?
             '''
             if self.db.execute_update(query, tuple(params)):
                 return {'success': True}
@@ -400,8 +821,15 @@ class RequestHandler:
         user_token = data.get('user_token')
         user_id = data.get('user_id')
         contact_login = data.get('contact_login')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
         result = self.db.execute_query(
             'select * from users where login = ?',
@@ -433,8 +861,13 @@ class RequestHandler:
     def handle_get_contacts(self, data):
         user_token = data.get('user_token')
         user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
@@ -457,8 +890,13 @@ class RequestHandler:
         user_token = data.get('user_token')
         user_id = data.get('user_id')
         contact_login = data.get('contact_login')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
@@ -484,8 +922,16 @@ class RequestHandler:
         user_id = data.get('user_id')
         contact_login = data.get('contact_login')
         display_name = data.get('display_name')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
         query = '''
             insert or replace into contact_settings 
             (user_login, contact_login, display_name)
@@ -500,8 +946,15 @@ class RequestHandler:
     def handle_get_contact_settings(self, data):
         user_token = data.get('user_token')
         user_id = data.get('user_id')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
         result = self.db.execute_query(
             'select contact_login, display_name from contact_settings where user_login = ?',
@@ -521,8 +974,16 @@ class RequestHandler:
         user_token = data.get('user_token')
         user_id = data.get('user_id')
         contact_login = data.get('contact_login')
+        session_token = data.get('session_token', '')
 
-        user = self.db.get_user_by_token(user_token, user_id)
+        if session_token:
+            user = self.db.get_user_by_session_token(session_token, user_id)
+        else:
+            user = self.db.get_user_by_token(user_token, user_id)
+
+        if not user:
+            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+
         query = '''
             delete from contacts 
             where contact_owner = ? and contact_login = ?
@@ -565,6 +1026,8 @@ def handle_client(client_socket, address):
 
 
 def start_server(host=SERVER_HOST, port=SERVER_PORT):
+    start_session_cleanup_timer()
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
