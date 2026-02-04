@@ -7,12 +7,12 @@ import datetime
 import os
 import hashlib
 import base64
+import hmac
 from pathlib import Path
 import secrets
-import time
 from threading import Timer
 
-SERVER_HOST = '5.35.80.248'
+SERVER_HOST = 'localhost'
 SERVER_PORT = 5000
 MAX_CONNECTIONS = 10000
 BUFFER_SIZE = 4096
@@ -24,6 +24,8 @@ AVATARS_DIR.mkdir(exist_ok=True)
 CLEANUP_INTERVAL = 86400
 
 session_cleanup_timer = None
+
+SECRET_KEY = secrets.token_hex(32).encode()
 
 
 def start_session_cleanup_timer(interval=CLEANUP_INTERVAL):
@@ -107,6 +109,41 @@ def migrate_password_in_database(db, login, password):
     return stored_password
 
 
+def create_session_token(session_id, user_id):
+    data = f"{session_id}:{user_id}"
+    signature = hmac.new(
+        SECRET_KEY,
+        data.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    token_data = f"{session_id}:{signature}"
+    return base64.b64encode(token_data.encode()).decode()
+
+
+def verify_session_token(session_token, user_id):
+    try:
+        token_data = base64.b64decode(session_token.encode()).decode()
+        parts = token_data.split(":")
+        if len(parts) != 2:
+            return None
+
+        session_id, signature = parts
+
+        expected_data = f"{session_id}:{user_id}"
+        expected_signature = hmac.new(
+            SECRET_KEY,
+            expected_data.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if signature != expected_signature:
+            return None
+
+        return session_id
+    except:
+        return None
+
+
 class Database:
     def __init__(self, db_path='messenger.db'):
         self.db_path = db_path
@@ -167,7 +204,6 @@ class Database:
                 session_id text primary key,
                 user_id integer not null,
                 user_login text not null,
-                session_token_hash text not null,
                 created_at datetime default current_timestamp,
                 last_used_at datetime default current_timestamp,
                 is_active integer default 1,
@@ -202,16 +238,18 @@ class Database:
         return None
 
     def get_user_by_session_token(self, session_token, user_id):
+        session_id = verify_session_token(session_token, user_id)
+        if not session_id:
+            return None
+
         conn = self.get_connection()
         cursor = conn.cursor()
-
-        session_token_hash = hashlib.sha256(session_token.encode()).hexdigest()
 
         cursor.execute('''
             select u.* from users u
             join user_sessions s on u.user_id = s.user_id
-            where s.session_token_hash = ? and u.user_id = ? and s.is_active = 1
-        ''', (session_token_hash, user_id))
+            where s.session_id = ? and u.user_id = ? and s.is_active = 1
+        ''', (session_id, user_id))
 
         user = cursor.fetchone()
         conn.close()
@@ -234,16 +272,14 @@ class Database:
             return [dict(session) for session in sessions]
         return []
 
-    def create_user_session(self, user_id, user_login, session_id, session_token):
+    def create_user_session(self, user_id, user_login, session_id):
         conn = self.get_connection()
         cursor = conn.cursor()
 
-        session_token_hash = hashlib.sha256(session_token.encode()).hexdigest()
-
         cursor.execute('''
-            insert into user_sessions (session_id, user_id, user_login, session_token_hash)
-            values (?, ?, ?, ?)
-        ''', (session_id, user_id, user_login, session_token_hash))
+            insert into user_sessions (session_id, user_id, user_login)
+            values (?, ?, ?)
+        ''', (session_id, user_id, user_login))
 
         cursor.execute('''
             select cleanup_interval from cleanup_settings where user_id = ?
@@ -465,9 +501,9 @@ class RequestHandler:
                 print(f"Пароль пользователя {login} мигрирован к новому формату")
 
             session_id = str(uuid.uuid4())
-            session_token = secrets.token_urlsafe(64)
+            session_token = create_session_token(session_id, user['user_id'])
 
-            self.db.create_user_session(user['user_id'], user['login'], session_id, session_token)
+            self.db.create_user_session(user['user_id'], user['login'], session_id)
 
             return {
                 'success': True,
@@ -509,7 +545,7 @@ class RequestHandler:
         if not user:
             return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
-        if user_token and session_token:
+        if user_token:
             self.db.update_session_last_used(user_token)
 
         return {
