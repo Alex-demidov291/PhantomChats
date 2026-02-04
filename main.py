@@ -1,5 +1,7 @@
 from PyQt6.QtWidgets import QApplication, QMainWindow
 from PyQt6.QtCore import QTimer
+
+from network import make_server_request
 from styles import style_input_dialog
 from authorization.login_window import LoginWindow
 from authorization.register_window import RegisterWindow
@@ -10,13 +12,16 @@ import sys
 import traceback
 import os
 
+
 def catch_all_exceptions():
     def excepthook(exc_type, exc_value, exc_traceback):
         print(f"Поймана ошибка:\n{''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}")
 
     sys.excepthook = excepthook
 
+
 catch_all_exceptions()
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -69,12 +74,26 @@ class MainWindow(QMainWindow):
             self.chat_window.load_chat_history()
 
     def logout(self):
+        if self.user_token and self.user_id:
+            make_server_request('logout_current', {
+                'user_token': self.user_token,
+                'user_id': self.user_id
+            })
+
         self.timer.stop()
         self.current_user = None
         self.user_token = None
         self.user_id = None
         self.username = None
         self.show_login_window()
+
+    def closeEvent(self, event):
+        if self.user_token and self.user_id:
+            make_server_request('logout_current', {
+                'user_token': self.user_token,
+                'user_id': self.user_id
+            })
+        event.accept()
 
     def _clear_current_widget(self):
         if self.current_widget:
