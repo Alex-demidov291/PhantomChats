@@ -12,7 +12,7 @@ from pathlib import Path
 import secrets
 from threading import Timer
 
-SERVER_HOST = 'localhost'
+SERVER_HOST = '5.35.80.248'
 SERVER_PORT = 5000
 MAX_CONNECTIONS = 10000
 BUFFER_SIZE = 4096
