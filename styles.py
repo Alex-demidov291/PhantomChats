@@ -110,7 +110,29 @@ QPushButton:pressed {
     background: #bb0010;
 }
 """
-
+style_round_btn = """
+QPushButton {
+    border-radius: 15px;
+    border: 1px solid #cccccc;
+    background: #ffffff;
+    padding: 8px 12px;
+    transition: all 0.1s ease;
+}
+QPushButton:hover {
+    border: 2px solid #007acc;
+    background: #f5f5f5;
+}
+QPushButton:pressed {
+    background: #e0e0e0;
+    border: 2px solid #005a9e;
+    padding: 9px 11px 7px 13px;  /* Эффект нажатия */
+}
+QPushButton:disabled {
+    background: #f0f0f0;
+    border: 1px solid #dddddd;
+    color: #999999;
+}
+"""
 style_mesg = """
 QTextEdit {
     border-radius: 15px;
@@ -122,19 +144,54 @@ QTextEdit {
 QTextEdit:focus {
     border: 2px solid #007acc;
 }
+QTextEdit QScrollBar:vertical {
+    border: none;
+    background: #f0f0f0;
+    width: 8px;
+    border-radius: 4px;
+    margin: 0px;
+}
+QTextEdit QScrollBar::handle:vertical {
+    background: #c0c0c0;
+    border-radius: 4px;
+    min-height: 20px;
+}
+QTextEdit QScrollBar::handle:vertical:hover {
+    background: #a0a0a0;
+}
+QTextEdit QScrollBar::add-line:vertical, QTextEdit QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+    height: 0px;
+}
+QTextEdit QScrollBar::add-page:vertical, QTextEdit QScrollBar::sub-page:vertical {
+    background: none;
+}
+QTextEdit QScrollBar:horizontal {
+    border: none;
+    background: #f0f0f0;
+    height: 8px;
+    border-radius: 4px;
+    margin: 0px;
+}
+QTextEdit QScrollBar::handle:horizontal {
+    background: #c0c0c0;
+    border-radius: 4px;
+    min-width: 20px;
+}
+QTextEdit QScrollBar::handle:horizontal:hover {
+    background: #a0a0a0;
+}
+QTextEdit QScrollBar::add-line:horizontal, QTextEdit QScrollBar::sub-line:horizontal {
+    border: none;
+    background: none;
+    width: 0px;
+}
+QTextEdit QScrollBar::add-page:horizontal, QTextEdit QScrollBar::sub-page:horizontal {
+    background: none;
+}
 """
 
-style_round_btn = """
-QPushButton {
-    border-radius: 15px;
-    border: 1px solid #cccccc;
-    background: #ffffff;
-    padding: 8px 12px;
-}
-QPushButton:hover {
-    background: #f0f0f0;
-}
-"""
 
 style_chat_list = """
 QListWidget {
@@ -216,7 +273,7 @@ QInputDialog QPushButton:hover {
 }
 """
 
-SERVER_URL = "http://localhost:5000/api"
+SERVER_URL = "https://5.35.80.248:5000/api"
 angle_alf = "abcdefghijklmnopqrstuvwxyz@!#*?"
 numbers = "1234567890"
 from pathlib import Path

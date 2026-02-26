@@ -1,153 +1,66 @@
-import socket
-import threading
-import json
 import sqlite3
 import uuid
 import datetime
-import os
 import hashlib
 import base64
 import hmac
-from pathlib import Path
 import secrets
-from threading import Timer
+import json
+import threading
+import queue
+import time
+from collections import defaultdict
+from flask import Flask, request, jsonify, Response, stream_with_context
+from PIL import Image
+import io
+import opaque_ke_py
+
+
+def adapt_datetime(dt):
+    return dt.isoformat()
+
+
+sqlite3.register_adapter(datetime.datetime, adapt_datetime)
 
 SERVER_HOST = '5.35.80.248'
 SERVER_PORT = 5000
-MAX_CONNECTIONS = 10000
-BUFFER_SIZE = 4096
-active_connections = {}
-
-AVATARS_DIR = Path('avatars')
-AVATARS_DIR.mkdir(exist_ok=True)
-
-CLEANUP_INTERVAL = 86400
-
-session_cleanup_timer = None
-
 SECRET_KEY = secrets.token_hex(32).encode()
+TOKEN_LIFETIME = 86400
+app = Flask(__name__)
+SERVER_SETUP = opaque_ke_py.server_setup()
+SERVER_SETUP_BYTES = SERVER_SETUP.to_bytes()
+
+request_log = defaultdict(list)
+request_lock = threading.Lock()
+RATE_LIMIT = 10
+RATE_PERIOD = 1
+BLOCK_ATTEMPTS = 8
+BLOCK_DURATION = 3600
 
 
-def start_session_cleanup_timer(interval=CLEANUP_INTERVAL):
-    global session_cleanup_timer
-    if session_cleanup_timer:
-        session_cleanup_timer.cancel()
+def rate_limit(f):
+    def decorated(*args, **kwargs):
+        device_id = request.headers.get('X-Device-ID')
+        if not device_id:
+            return jsonify({'success': False, 'error': 'Device ID required'}), 400
+        now = time.time()
+        with request_lock:
+            request_log[device_id] = [t for t in request_log[device_id] if now - t < RATE_PERIOD]
+            if len(request_log[device_id]) >= RATE_LIMIT:
+                return jsonify({'success': False, 'error': 'Too many requests'}), 429
+            request_log[device_id].append(now)
+        return f(*args, **kwargs)
 
-    def cleanup_job():
-        cleanup_expired_sessions()
-        start_session_cleanup_timer(interval)
-
-    session_cleanup_timer = Timer(interval, cleanup_job)
-    session_cleanup_timer.daemon = True
-    session_cleanup_timer.start()
-
-
-def cleanup_expired_sessions():
-    conn = sqlite3.connect('messenger.db', check_same_thread=False)
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        select distinct user_id from cleanup_settings where cleanup_interval = 0
-    ''')
-    users_immediate = [row[0] for row in cursor.fetchall()]
-
-    for user_id in users_immediate:
-        cursor.execute('''
-            delete from user_sessions 
-            where user_id = ? and is_active = 0
-        ''', (user_id,))
-
-    cursor.execute('''
-        select distinct user_id, cleanup_interval from cleanup_settings where cleanup_interval > 0
-    ''')
-    users_with_interval = cursor.fetchall()
-
-    for user_id, interval in users_with_interval:
-        cutoff_time = datetime.datetime.now() - datetime.timedelta(seconds=interval)
-        cursor.execute('''
-            delete from user_sessions 
-            where user_id = ? and is_active = 0 and last_used_at < ?
-        ''', (user_id, cutoff_time))
-
-    conn.commit()
-    conn.close()
-
-
-def verify_password(password, stored_hash):
-    if not stored_hash:
-        return False
-
-    if ':' in stored_hash:
-        stored_hash_parts = stored_hash.split(':')
-        if len(stored_hash_parts) != 2:
-            return False
-
-        stored_password_hash, salt = stored_hash_parts
-        new_hash = hashlib.sha256((password + salt).encode()).hexdigest()
-
-        return new_hash == stored_password_hash
-    else:
-        old_hash = hashlib.sha256(password.encode()).hexdigest()
-        return old_hash == stored_hash
-
-
-def migrate_password_in_database(db, login, password):
-    conn = db.get_connection()
-    cursor = conn.cursor()
-
-    salt = base64.b64encode(os.urandom(16)).decode('utf-8')[:16]
-    new_hash = hashlib.sha256((password + salt).encode()).hexdigest()
-    stored_password = f"{new_hash}:{salt}"
-
-    cursor.execute(
-        'update users set password = ? where login = ?',
-        (stored_password, login)
-    )
-    conn.commit()
-    conn.close()
-
-    return stored_password
-
-
-def create_session_token(session_id, user_id):
-    data = f"{session_id}:{user_id}"
-    signature = hmac.new(
-        SECRET_KEY,
-        data.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    token_data = f"{session_id}:{signature}"
-    return base64.b64encode(token_data.encode()).decode()
-
-
-def verify_session_token(session_token, user_id):
-    try:
-        token_data = base64.b64decode(session_token.encode()).decode()
-        parts = token_data.split(":")
-        if len(parts) != 2:
-            return None
-
-        session_id, signature = parts
-
-        expected_data = f"{session_id}:{user_id}"
-        expected_signature = hmac.new(
-            SECRET_KEY,
-            expected_data.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        if signature != expected_signature:
-            return None
-
-        return session_id
-    except:
-        return None
+    decorated.__name__ = f.__name__
+    return decorated
 
 
 class Database:
+    # -- работа с базой данных
     def __init__(self, db_path='messenger.db'):
         self.db_path = db_path
         self.init_db()
+        self.start_cleanup_thread()
 
     def get_connection(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -158,152 +71,260 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            create table if not exists users (
-                login text primary key,
-                password text not null,
-                username text not null unique,
-                avatar text,
-                user_token text unique,
-                user_id integer unique
+            CREATE TABLE IF NOT EXISTS users (
+                login TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                user_token TEXT UNIQUE,
+                user_id INTEGER UNIQUE,
+                avatar_version INTEGER DEFAULT 0,
+                opaque_password_file BLOB NOT NULL,
+                e2ee_salt TEXT,
+                encrypted_master_key TEXT,
+                master_key_salt TEXT
             )
         ''')
         cursor.execute('''
-            create table if not exists messages (
-                id integer primary key autoincrement,
-                sender_login text not null,
-                receiver_login text not null,
-                message_text text not null,
-                timestamp datetime default current_timestamp,
-                foreign key (sender_login) references users (login),
-                foreign key (receiver_login) references users (login)
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_login TEXT NOT NULL,
+                receiver_login TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                has_file INTEGER DEFAULT 0,
+                file_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                client_timestamp TEXT,
+                nonce TEXT,
+                FOREIGN KEY (sender_login) REFERENCES users (login),
+                FOREIGN KEY (receiver_login) REFERENCES users (login),
+                FOREIGN KEY (file_id) REFERENCES files(id)
             )
         ''')
         cursor.execute('''
-            create table if not exists contacts (
-                id integer primary key autoincrement,
-                contact_owner text not null,
-                contact_login text not null,
-                foreign key (contact_owner) references users(login),
-                foreign key (contact_login) references users(login),
-                unique(contact_owner, contact_login)
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                file_data BLOB NOT NULL,
+                thumbnail_data BLOB,
+                uploaded_by TEXT NOT NULL,
+                uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_image_only INTEGER DEFAULT 0,
+                encrypted_key TEXT,
+                nonce_file TEXT,
+                nonce_thumbnail TEXT,
+                is_encrypted INTEGER DEFAULT 0,
+                FOREIGN KEY (uploaded_by) REFERENCES users(login)
             )
         ''')
         cursor.execute('''
-            create table if not exists contact_settings (
-                id integer primary key autoincrement,
-                user_login text not null,
-                contact_login text not null,
-                display_name text,
-                foreign key (user_login) references users(login),
-                foreign key (contact_login) references users(login),
-                unique(user_login, contact_login)
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contact_owner TEXT NOT NULL,
+                contact_login TEXT NOT NULL,
+                FOREIGN KEY (contact_owner) REFERENCES users(login),
+                FOREIGN KEY (contact_login) REFERENCES users(login),
+                UNIQUE(contact_owner, contact_login)
             )
         ''')
         cursor.execute('''
-            create table if not exists user_sessions (
-                session_id text primary key,
-                user_id integer not null,
-                user_login text not null,
-                created_at datetime default current_timestamp,
-                last_used_at datetime default current_timestamp,
-                is_active integer default 1,
-                foreign key (user_id) references users(user_id),
-                foreign key (user_login) references users(login)
+            CREATE TABLE IF NOT EXISTS contact_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_login TEXT NOT NULL,
+                contact_login TEXT NOT NULL,
+                display_name TEXT,
+                FOREIGN KEY (user_login) REFERENCES users(login),
+                FOREIGN KEY (contact_login) REFERENCES users(login),
+                UNIQUE(user_login, contact_login)
             )
         ''')
         cursor.execute('''
-            create table if not exists cleanup_settings (
-                user_id integer primary key,
-                cleanup_interval integer default 0,
-                foreign key (user_id) references users(user_id)
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                user_login TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (user_login) REFERENCES users(login)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cleanup_settings (
+                user_id INTEGER PRIMARY KEY,
+                cleanup_interval INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_avatars (
+                user_id INTEGER PRIMARY KEY,
+                avatar_data BLOB NOT NULL,
+                file_size INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS opaque_login_states (
+                state_id TEXT PRIMARY KEY,
+                login TEXT NOT NULL,
+                server_state BLOB NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                FOREIGN KEY (login) REFERENCES users(login)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                last_attempt TIMESTAMP,
+                blocked_until TIMESTAMP,
+                UNIQUE(login, device_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_public_keys (
+                user_id INTEGER PRIMARY KEY,
+                public_key TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         ''')
         conn.commit()
         conn.close()
 
-    def get_user_by_token(self, user_token, user_id):
+    def start_cleanup_thread(self):
+        def cleanup_worker():
+            while True:
+                time.sleep(300)
+                self.cleanup_expired_sessions()
+
+        thread = threading.Thread(target=cleanup_worker, daemon=True)
+        thread.start()
+
+    def cleanup_expired_sessions(self):
         conn = self.get_connection()
         cursor = conn.cursor()
-
         cursor.execute('''
-            select u.* from users u
-            join user_sessions s on u.user_id = s.user_id
-            where s.session_id = ? and u.user_id = ? and s.is_active = 1
-        ''', (user_token, user_id))
-
-        user = cursor.fetchone()
+            SELECT DISTINCT user_id FROM user_sessions 
+            WHERE expires_at < datetime('now') AND is_active = 1
+        ''')
+        expired_users = cursor.fetchall()
+        for user in expired_users:
+            user_id = user[0]
+            cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+            cleanup = cursor.fetchone()
+            if cleanup and cleanup[0] == 0:
+                cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND expires_at < datetime("now")',
+                               (user_id,))
+            else:
+                cursor.execute('''
+                    UPDATE user_sessions SET is_active = 0 
+                    WHERE user_id = ? AND expires_at < datetime("now")
+                ''', (user_id,))
+        conn.commit()
         conn.close()
-        if user:
-            return dict(user)
+
+    def get_login_attempt(self, login, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT attempts, last_attempt, blocked_until FROM login_attempts WHERE login = ? AND device_id = ?',
+            (login, device_id))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return dict(row)
         return None
 
-    def get_user_by_session_token(self, session_token, user_id):
-        session_id = verify_session_token(session_token, user_id)
-        if not session_id:
-            return None
-
+    def increment_login_attempt(self, login, device_id):
+        now = datetime.datetime.now().isoformat()
         conn = self.get_connection()
         cursor = conn.cursor()
-
         cursor.execute('''
-            select u.* from users u
-            join user_sessions s on u.user_id = s.user_id
-            where s.session_id = ? and u.user_id = ? and s.is_active = 1
-        ''', (session_id, user_id))
-
-        user = cursor.fetchone()
+            INSERT INTO login_attempts (login, device_id, attempts, last_attempt)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(login, device_id) DO UPDATE SET
+                attempts = attempts + 1,
+                last_attempt = ?
+        ''', (login, device_id, now, now))
+        conn.commit()
+        cursor.execute('SELECT attempts FROM login_attempts WHERE login = ? AND device_id = ?', (login, device_id))
+        attempts = cursor.fetchone()[0]
+        if attempts >= BLOCK_ATTEMPTS:
+            blocked_until = (datetime.datetime.now() + datetime.timedelta(seconds=BLOCK_DURATION)).isoformat()
+            cursor.execute(
+                'UPDATE login_attempts SET blocked_until = ?, attempts = 0 WHERE login = ? AND device_id = ?',
+                (blocked_until, login, device_id))
+            conn.commit()
         conn.close()
-        if user:
-            return dict(user)
-        return None
+        return True
 
-    def get_user_sessions(self, user_id):
+    def reset_login_attempt(self, login, device_id):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            select session_id, created_at, last_used_at, is_active
-            from user_sessions
-            where user_id = ?
-            order by last_used_at desc
-        ''', (user_id,))
-        sessions = cursor.fetchall()
-        conn.close()
-        if sessions:
-            return [dict(session) for session in sessions]
-        return []
-
-    def create_user_session(self, user_id, user_login, session_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            insert into user_sessions (session_id, user_id, user_login)
-            values (?, ?, ?)
-        ''', (session_id, user_id, user_login))
-
-        cursor.execute('''
-            select cleanup_interval from cleanup_settings where user_id = ?
-        ''', (user_id,))
-        cleanup_result = cursor.fetchone()
-
-        if cleanup_result and cleanup_result[0] == 0:
-            cursor.execute('''
-                delete from user_sessions 
-                where user_id = ? and is_active = 0
-            ''', (user_id,))
-
+        cursor.execute('DELETE FROM login_attempts WHERE login = ? AND device_id = ?', (login, device_id))
         conn.commit()
         conn.close()
         return True
 
-    def update_session_last_used(self, session_id):
+    def is_login_blocked(self, login, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT blocked_until FROM login_attempts WHERE login = ? AND device_id = ?', (login, device_id))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            blocked_until = datetime.datetime.fromisoformat(row[0])
+            if blocked_until > datetime.datetime.now():
+                seconds = (blocked_until - datetime.datetime.now()).seconds
+                return True, seconds
+        return False, 0
+
+    def get_user_by_token(self, session_id, user_id):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            update user_sessions
-            set last_used_at = datetime('now')
-            where session_id = ?
-        ''', (session_id,))
+            SELECT u.* FROM users u
+            JOIN user_sessions s ON u.user_id = s.user_id
+            WHERE s.session_id = ? AND u.user_id = ? 
+            AND s.is_active = 1 AND s.expires_at > datetime('now')
+        ''', (session_id, user_id))
+        user = cursor.fetchone()
+        conn.close()
+        if user:
+            return dict(user)
+        return None
+
+    def get_user_by_login(self, login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE login = ?', (login,))
+        user = cursor.fetchone()
+        conn.close()
+        if user:
+            return dict(user)
+        return None
+
+    def create_user_session(self, user_id, user_login, session_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        expires_at = datetime.datetime.now() + datetime.timedelta(seconds=TOKEN_LIFETIME)
+        cursor.execute('''
+            INSERT INTO user_sessions (session_id, user_id, user_login, expires_at)
+            VALUES (?, ?, ?, ?)
+        ''', (session_id, user_id, user_login, expires_at))
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
         conn.commit()
         conn.close()
         return True
@@ -312,22 +333,12 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            update user_sessions
-            set is_active = 0
-            where session_id = ? and user_id = ?
+            UPDATE user_sessions SET is_active = 0 WHERE session_id = ? AND user_id = ?
         ''', (session_id, user_id))
-
-        cursor.execute('''
-            select cleanup_interval from cleanup_settings where user_id = ?
-        ''', (user_id,))
-        cleanup_result = cursor.fetchone()
-
-        if cleanup_result and cleanup_result[0] == 0:
-            cursor.execute('''
-                delete from user_sessions 
-                where user_id = ? and is_active = 0
-            ''', (user_id,))
-
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
         conn.commit()
         conn.close()
         return True
@@ -336,22 +347,13 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            update user_sessions
-            set is_active = 0
-            where user_id = ? and session_id != ?
+            UPDATE user_sessions SET is_active = 0 
+            WHERE user_id = ? AND session_id != ? AND expires_at > datetime('now')
         ''', (user_id, except_session_id))
-
-        cursor.execute('''
-            select cleanup_interval from cleanup_settings where user_id = ?
-        ''', (user_id,))
-        cleanup_result = cursor.fetchone()
-
-        if cleanup_result and cleanup_result[0] == 0:
-            cursor.execute('''
-                delete from user_sessions 
-                where user_id = ? and is_active = 0
-            ''', (user_id,))
-
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
         conn.commit()
         conn.close()
         return True
@@ -359,729 +361,1276 @@ class Database:
     def deactivate_all_sessions(self, user_id):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            update user_sessions
-            set is_active = 0
-            where user_id = ?
-        ''', (user_id,))
-
-        cursor.execute('''
-            select cleanup_interval from cleanup_settings where user_id = ?
-        ''', (user_id,))
-        cleanup_result = cursor.fetchone()
-
-        if cleanup_result and cleanup_result[0] == 0:
-            cursor.execute('''
-                delete from user_sessions 
-                where user_id = ? and is_active = 0
-            ''', (user_id,))
-
+        cursor.execute('UPDATE user_sessions SET is_active = 0 WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
         conn.commit()
         conn.close()
         return True
 
-    def get_cleanup_interval(self, user_id):
+    def update_session_last_used(self, session_id):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            select cleanup_interval from cleanup_settings where user_id = ?
-        ''', (user_id,))
-        result = cursor.fetchone()
+            UPDATE user_sessions SET last_used_at = datetime('now') 
+            WHERE session_id = ?
+        ''', (session_id,))
+        conn.commit()
         conn.close()
-        if result:
-            return result[0]
-        return 0
+        return True
+
+    def get_user_sessions(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT session_id, created_at, last_used_at, expires_at, is_active
+            FROM user_sessions WHERE user_id = ? ORDER BY last_used_at DESC
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
+
+    def get_cleanup_interval(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else 0
 
     def set_cleanup_interval(self, user_id, interval):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            insert or replace into cleanup_settings (user_id, cleanup_interval)
-            values (?, ?)
+            INSERT OR REPLACE INTO cleanup_settings (user_id, cleanup_interval) VALUES (?, ?)
         ''', (user_id, interval))
-
         if interval == 0:
-            cursor.execute('''
-                delete from user_sessions 
-                where user_id = ? and is_active = 0
-            ''', (user_id,))
-            print(f"[*] Немедленная очистка завершенных сессий для пользователя {user_id}")
-
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
         conn.commit()
         conn.close()
         return True
 
-    def execute_query(self, query, params=()):
+    def get_user_avatar_version(self, user_id):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute(query, params)
-        result = cursor.fetchall()
+        cursor.execute('SELECT avatar_version FROM users WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else 0
+
+    def get_avatar_versions(self, user_ids):
+        if not user_ids:
+            return {}
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join(['?'] * len(user_ids))
+        query = 'SELECT user_id, avatar_version FROM users WHERE user_id IN (' + placeholders + ')'
+        cursor.execute(query, user_ids)
+        rows = cursor.fetchall()
+        conn.close()
+        return {row[0]: row[1] for row in rows}
+
+    def get_avatar_data(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT avatar_data FROM user_avatars WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def update_user_avatar(self, user_id, avatar_data):
+        compressed = self._compress_avatar(avatar_data)
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET avatar_version = avatar_version + 1 WHERE user_id = ?', (user_id,))
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_avatars (user_id, avatar_data, file_size)
+            VALUES (?, ?, ?)
+        ''', (user_id, compressed, len(compressed)))
+        conn.commit()
+        new_version = cursor.execute('SELECT avatar_version FROM users WHERE user_id = ?', (user_id,)).fetchone()[0]
+        conn.close()
+        return True, new_version
+
+    def _compress_avatar(self, image_data):
+        img = Image.open(io.BytesIO(image_data))
+        if img.width > 8000 or img.height > 5000:
+            raise ValueError("Изображение слишком большое (максимум 8000x5000)")
+        if len(image_data) > 150 * 1024:
+            raise ValueError("Изображение слишком тяжелое (максимум 150KB)")
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85, optimize=True, progressive=True)
+        compressed = output.getvalue()
+        if len(compressed) > 150 * 1024:
+            output = io.BytesIO()
+            quality = 70
+            while len(compressed) > 150 * 1024 and quality >= 30:
+                img.save(output, format='JPEG', quality=quality, optimize=True, progressive=True)
+                compressed = output.getvalue()
+                quality -= 10
+        return compressed
+
+    def save_file(self, file_data, file_name, file_type, uploaded_by,
+                  is_image_only=False, encrypted_key=None, nonce_file=None,
+                  thumbnail_data=None, nonce_thumbnail=None):
+        file_size = len(file_data)
+        if file_size > 10 * 1024 * 1024:
+            return False, "Файл слишком большой (максимум 10MB)"
+
+        is_encrypted = 1 if encrypted_key else 0
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO files (
+                file_name, file_type, file_size, file_data, thumbnail_data,
+                uploaded_by, is_image_only, encrypted_key, nonce_file,
+                nonce_thumbnail, is_encrypted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (file_name, file_type, file_size, file_data, thumbnail_data,
+              uploaded_by, 1 if is_image_only else 0, encrypted_key,
+              nonce_file, nonce_thumbnail, is_encrypted))
+        file_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        if result:
-            return [dict(row) for row in result]
+        return True, file_id
+
+    def _generate_thumbnail(self, image_data, max_size=(200, 200)):
+        img = Image.open(io.BytesIO(image_data))
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=70, optimize=True)
+        return output.getvalue()
+
+    def get_file(self, file_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM files WHERE id = ?', (file_id,))
+        file = cursor.fetchone()
+        conn.close()
+        if file:
+            return dict(file)
         return None
 
-    def execute_update(self, query, params=()):
+    def get_file_thumbnail(self, file_id):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        cursor.execute('SELECT thumbnail_data FROM files WHERE id = ?', (file_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def send_message(self, sender_login, receiver_login, text, file_id=None, client_timestamp=None, nonce=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        has_file = 1 if file_id else 0
+        cursor.execute('''
+            INSERT INTO messages (sender_login, receiver_login, message_text, has_file, file_id, client_timestamp, nonce)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (sender_login, receiver_login, text, has_file, file_id, client_timestamp, nonce))
+        msg_id = cursor.lastrowid
+        cursor.execute('''
+            SELECT id, sender_login, receiver_login, message_text, has_file, file_id, timestamp, client_timestamp, nonce
+            FROM messages WHERE id = ?
+        ''', (msg_id,))
+        msg = dict(cursor.fetchone())
+        conn.commit()
+        conn.close()
+        return msg
+
+    def get_messages(self, user_login, other_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT m.*, u.username AS sender_name
+            FROM messages m
+            JOIN users u ON m.sender_login = u.login
+            WHERE (m.sender_login = ? AND m.receiver_login = ?)
+               OR (m.sender_login = ? AND m.receiver_login = ?)
+            ORDER BY m.timestamp ASC
+            LIMIT 50
+        ''', (user_login, other_login, other_login, user_login))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
+
+    def get_messages_since(self, user_login, contact_login, since_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT m.*, u.username AS sender_name
+            FROM messages m
+            JOIN users u ON m.sender_login = u.login
+            WHERE ((m.sender_login = ? AND m.receiver_login = ?)
+               OR (m.sender_login = ? AND m.receiver_login = ?))
+               AND m.id > ?
+            ORDER BY m.timestamp ASC
+        ''', (user_login, contact_login, contact_login, user_login, since_id))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
+
+    def add_contact(self, owner_login, contact_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO contacts (contact_owner, contact_login) VALUES (?, ?)
+        ''', (owner_login, contact_login))
         conn.commit()
         conn.close()
         return True
 
+    def remove_contact(self, owner_login, contact_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM contacts WHERE contact_owner = ? AND contact_login = ?
+        ''', (owner_login, contact_login))
+        conn.commit()
+        conn.close()
+        return True
 
-class RequestHandler:
-    def __init__(self):
-        self.db = Database()
+    def get_contacts(self, owner_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.login, u.username, u.user_id, u.avatar_version
+            FROM contacts c
+            JOIN users u ON c.contact_login = u.login
+            WHERE c.contact_owner = ?
+            ORDER BY u.username
+        ''', (owner_login,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
 
-    def handle_request(self, request_data):
-        request = json.loads(request_data.decode('utf-8'))
-        endpoint = request.get('endpoint')
-        data = request.get('data', {})
+    def is_contact(self, owner_login, contact_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM contacts WHERE contact_owner = ? AND contact_login = ?',
+                       (owner_login, contact_login))
+        result = cursor.fetchone() is not None
+        conn.close()
+        return result
 
-        if not endpoint:
-            return {'success': False, 'error': 'Endpoint not specified'}
+    def search_users(self, query, current_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        pattern = f'%{query}%'
+        cursor.execute('''
+            SELECT login, username, user_id, avatar_version
+            FROM users
+            WHERE (login LIKE ? OR username LIKE ?) AND login != ?
+            LIMIT 20
+        ''', (pattern, pattern, current_login))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
 
-        method_name = f'handle_{endpoint}'
-        if hasattr(self, method_name):
-            result = getattr(self, method_name)(data)
-            return result
-        else:
-            return {'success': False, 'error': f'Unknown endpoint: {endpoint}'}
+    def get_contact_settings(self, user_login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT contact_login, display_name FROM contact_settings WHERE user_login = ?
+        ''', (user_login,))
+        rows = cursor.fetchall()
+        conn.close()
+        return {row[0]: {'display_name': row[1]} for row in rows}
 
-    def handle_register(self, data):
-        login = data.get('login')
-        password = data.get('password')
-        username = data.get('username')
+    def save_contact_settings(self, user_login, contact_login, display_name):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO contact_settings (user_login, contact_login, display_name)
+            VALUES (?, ?, ?)
+        ''', (user_login, contact_login, display_name))
+        conn.commit()
+        conn.close()
+        return True
 
-        if not login or not password or not username:
-            return {'success': False, 'error': 'Все поля обязательны для заполнения'}
+    def save_opaque_password_file(self, login, password_file):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET opaque_password_file = ? WHERE login = ?', (password_file, login))
+        conn.commit()
+        conn.close()
+        return True
 
-        result = self.db.execute_query('select * from users where login = ?', (login,))
-        if result:
-            return {'success': False, 'error': 'Логин уже занят'}
+    def get_opaque_password_file(self, login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT opaque_password_file FROM users WHERE login = ?', (login,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
 
-        result = self.db.execute_query('select * from users where username = ?', (username,))
-        if result:
-            return {'success': False, 'error': 'Имя пользователя уже занято'}
+    def save_login_state(self, login, server_state):
+        state_id = str(uuid.uuid4())
+        expires_at = datetime.datetime.now() + datetime.timedelta(minutes=5)
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO opaque_login_states (state_id, login, server_state, expires_at)
+            VALUES (?, ?, ?, ?)
+        ''', (state_id, login, server_state, expires_at))
+        conn.commit()
+        conn.close()
+        return state_id
 
-        user_token = str(uuid.uuid4())
-        user_id = int(datetime.datetime.now().timestamp() * 1000000) % 1000000000
+    def get_login_state(self, state_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT login, server_state, expires_at FROM opaque_login_states WHERE state_id = ?',
+                       (state_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return dict(row)
+        return None
 
-        query = '''
-            insert into users (login, password, username, user_token, user_id)
-            values (?, ?, ?, ?, ?)
-        '''
+    def delete_login_state(self, state_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM opaque_login_states WHERE state_id = ?', (state_id,))
+        conn.commit()
+        conn.close()
+        return True
 
-        if self.db.execute_update(query, (login, password, username, user_token, user_id)):
-            self.db.set_cleanup_interval(user_id, 0)
-            return {
-                'success': True,
-                'user_token': user_token,
-                'user_id': user_id
-            }
-        else:
-            return {'success': False, 'error': 'Ошибка при регистрации пользователя'}
+    def get_user_public_key(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT public_key, signature FROM user_public_keys WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {'public_key': row[0], 'signature': row[1]}
+        return None
 
-    def handle_login(self, data):
-        login = data.get('login')
-        password = data.get('password')
+    def save_user_public_key(self, user_id, public_key, signature):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_public_keys (user_id, public_key, signature, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+        ''', (user_id, public_key, signature))
+        conn.commit()
+        conn.close()
+        return True
 
-        result = self.db.execute_query('select * from users where login = ?', (login,))
-        if not result:
-            return {'success': False, 'error': 'Неверный логин или пароль'}
+    def get_user_e2ee_salt(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT e2ee_salt FROM users WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
 
-        user = result[0]
-        stored_password = user['password']
+    def save_user_e2ee_salt(self, user_id, salt):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET e2ee_salt = ? WHERE user_id = ?', (salt, user_id))
+        conn.commit()
+        conn.close()
+        return True
 
-        if verify_password(password, stored_password):
-            if ':' not in stored_password:
-                new_password_hash = migrate_password_in_database(self.db, login, password)
-                print(f"Пароль пользователя {login} мигрирован к новому формату")
+    def save_encrypted_master_key(self, login, encrypted_master_key):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET encrypted_master_key = ? WHERE login = ?', (encrypted_master_key, login))
+        conn.commit()
+        conn.close()
+        return True
 
-            session_id = str(uuid.uuid4())
-            session_token = create_session_token(session_id, user['user_id'])
+    def get_encrypted_master_key(self, login):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT encrypted_master_key FROM users WHERE login = ?', (login,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
 
-            self.db.create_user_session(user['user_id'], user['login'], session_id)
 
-            return {
-                'success': True,
-                'user_token': session_id,
-                'session_token': session_token,
-                'user_id': user['user_id'],
-                'username': user['username']
-            }
-        else:
-            return {'success': False, 'error': 'Неверный логин или пароль'}
+db = Database()
 
-    def handle_logout_current(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
+def create_session_token(session_id, user_id):
+    data = f"{session_id}:{user_id}"
+    sig = hmac.new(SECRET_KEY, data.encode(), hashlib.sha256).hexdigest()
+    token = f"{session_id}:{sig}"
+    return base64.b64encode(token.encode()).decode()
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
 
-        self.db.deactivate_session(user_token, user_id)
+def verify_session_token(token, user_id):
+    decoded = base64.b64decode(token.encode()).decode()
+    session_id, sig = decoded.split(':', 1)
+    expected = f"{session_id}:{user_id}"
+    expected_sig = hmac.new(SECRET_KEY, expected.encode(), hashlib.sha256).hexdigest()
+    if sig != expected_sig:
+        return None
+    return session_id
 
-        return {'success': True}
 
-    def handle_info(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
+event_queues = {}
+event_queues_lock = threading.Lock()
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+def add_event(user_id, event_type, data):
+    with event_queues_lock:
+        if user_id not in event_queues:
+            event_queues[user_id] = queue.Queue()
+        event_queues[user_id].put((event_type, data))
 
+
+def get_event_queue(user_id):
+    with event_queues_lock:
+        return event_queues.get(user_id)
+
+
+def remove_event_queue(user_id):
+    with event_queues_lock:
+        if user_id in event_queues:
+            del event_queues[user_id]
+
+
+def login_required(f):
+    def decorated(*args, **kwargs):
+        data = request.get_json(silent=True) or {}
+        session_token = request.headers.get('X-Session-Token')
+        user_id = request.headers.get('X-User-Id')
+        user_token = request.headers.get('X-User-Token')
+        if not session_token and not user_token:
+            return jsonify({'success': False, 'error': 'Missing credentials'}), 401
+        if session_token and user_id:
+            session_id = verify_session_token(session_token, user_id)
+            if session_id:
+                user = db.get_user_by_token(session_id, user_id)
+                if user:
+                    db.update_session_last_used(session_id)
+                    return f(user, data, *args, **kwargs)
+        elif user_token and user_id:
+            user = db.get_user_by_token(user_token, user_id)
+            if user:
+                db.update_session_last_used(user_token)
+                return f(user, data, *args, **kwargs)
+        return jsonify({'success': False, 'error': 'Неверный токен или ID пользователя'}), 401
+
+    decorated.__name__ = f.__name__
+    return decorated
+
+
+@app.route('/api/opaque/register/start', methods=['POST'])
+@rate_limit
+def opaque_register_start():
+    data = request.get_json()
+    login = data.get('login')
+    username = data.get('username')
+    if not login or not username:
+        return jsonify({'success': False, 'error': 'Не указан логин или имя'})
+    if db.get_user_by_login(login):
+        return jsonify({'success': False, 'error': 'Логин уже занят'})
+    conn = db.get_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM users WHERE username = ?', (username,))
+    exists = cur.fetchone()
+    conn.close()
+    if exists:
+        return jsonify({'success': False, 'error': 'Имя пользователя уже занято'})
+    return jsonify({'success': True})
+
+
+@app.route('/api/opaque/register/finish', methods=['POST'])
+@rate_limit
+def opaque_register_finish():
+    data = request.get_json()
+    login = data.get('login')
+    username = data.get('username')
+    registration_request = base64.b64decode(data.get('registration_request'))
+    if not login or not username or not registration_request:
+        return jsonify({'success': False, 'error': 'Все поля обязательны'})
+    if db.get_user_by_login(login):
+        return jsonify({'success': False, 'error': 'Логин уже занят'})
+    server_setup = opaque_ke_py.ServerSetupData.from_bytes(SERVER_SETUP_BYTES)
+    server_reg_start = opaque_ke_py.server_registration_start(
+        server_setup,
+        registration_request,
+        login.encode('utf-8')
+    )
+    server_response = server_reg_start.get_message()
+    return jsonify({
+        'success': True,
+        'server_response': base64.b64encode(server_response).decode('utf-8')
+    })
+
+
+@app.route('/api/opaque/register/upload', methods=['POST'])
+@rate_limit
+def opaque_register_upload():
+    data = request.get_json()
+    login = data.get('login')
+    username = data.get('username')
+    registration_upload = base64.b64decode(data.get('registration_upload'))
+    encrypted_master_key = data.get('encrypted_master_key')
+    if not login or not username or not registration_upload or not encrypted_master_key:
+        return jsonify({'success': False, 'error': 'Все поля обязательны'})
+    if db.get_user_by_login(login):
+        return jsonify({'success': False, 'error': 'Логин уже занят'})
+    server_setup = opaque_ke_py.ServerSetupData.from_bytes(SERVER_SETUP_BYTES)
+    server_reg_finish = opaque_ke_py.server_registration_finish(registration_upload)
+    password_file = server_reg_finish.get_password_file()
+    user_id = int(datetime.datetime.now().timestamp() * 1000000) % 1000000000
+    conn = db.get_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO users (login, username, user_id, opaque_password_file, encrypted_master_key)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (login, username, user_id, password_file, encrypted_master_key))
+    conn.commit()
+    db.set_cleanup_interval(user_id, 0)
+    conn.close()
+    return jsonify({
+        'success': True,
+        'user_id': user_id
+    })
+
+
+@app.route('/api/opaque/login/start', methods=['POST'])
+@rate_limit
+def opaque_login_start():
+    data = request.get_json()
+    login = data.get('login')
+    credential_request = base64.b64decode(data.get('credential_request'))
+    device_id = request.headers.get('X-Device-ID')
+    if not login or not credential_request:
+        return jsonify({'success': False, 'error': 'Не указан логин или данные'})
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+
+    blocked, seconds = db.is_login_blocked(login, device_id)
+    if blocked:
+        return jsonify({'success': False, 'error': f'Слишком много попыток. Попробуйте через {seconds} секунд.'}), 429
+
+    user = db.get_user_by_login(login)
+    if not user:
+        db.increment_login_attempt(login, device_id)
+        return jsonify({'success': False, 'error': 'Пользователь не найден'}), 401
+
+    password_file = db.get_opaque_password_file(login)
+    if not password_file:
+        db.increment_login_attempt(login, device_id)
+        return jsonify({'success': False, 'error': 'Пользователь не зарегистрирован'}), 401
+
+    server_setup = opaque_ke_py.ServerSetupData.from_bytes(SERVER_SETUP_BYTES)
+    server_login_start = opaque_ke_py.server_login_start(
+        server_setup,
+        password_file,
+        credential_request,
+        login.encode('utf-8')
+    )
+
+    credential_response = server_login_start.get_message()
+    server_state = server_login_start.get_state()
+    state_id = db.save_login_state(login, server_state)
+
+    return jsonify({
+        'success': True,
+        'state_id': state_id,
+        'credential_response': base64.b64encode(credential_response).decode('utf-8')
+    })
+
+
+@app.route('/api/opaque/login/finish', methods=['POST'])
+@rate_limit
+def opaque_login_finish():
+    data = request.get_json()
+    state_id = data.get('state_id')
+    credential_finalization = base64.b64decode(data.get('credential_finalization'))
+    device_id = request.headers.get('X-Device-ID')
+    if not state_id or not credential_finalization:
+        return jsonify({'success': False, 'error': 'Не указаны данные'})
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+
+    state = db.get_login_state(state_id)
+    if not state:
+        return jsonify({'success': False, 'error': 'Сессия не найдена'})
+    expires_at = datetime.datetime.fromisoformat(state['expires_at'])
+    if expires_at < datetime.datetime.now():
+        db.delete_login_state(state_id)
+        return jsonify({'success': False, 'error': 'Сессия истекла'})
+
+    login = state['login']
+    server_state = state['server_state']
+
+    server_setup = opaque_ke_py.ServerSetupData.from_bytes(SERVER_SETUP_BYTES)
+    server_login_finish = opaque_ke_py.server_login_finish(server_state, credential_finalization)
+    server_session_key = server_login_finish.get_session_key()
+
+    db.delete_login_state(state_id)
+
+    user = db.get_user_by_login(login)
+    if not user:
+        return jsonify({'success': False, 'error': 'Пользователь не найден'})
+
+    db.reset_login_attempt(login, device_id)
+
+    session_id = str(uuid.uuid4())
+    session_token = create_session_token(session_id, user['user_id'])
+    db.create_user_session(user['user_id'], user['login'], session_id)
+
+    encrypted_master_key = db.get_encrypted_master_key(user['login'])
+
+    return jsonify({
+        'success': True,
+        'session_token': session_token,
+        'user_token': session_id,
+        'user_id': user['user_id'],
+        'username': user['username'],
+        'encrypted_master_key': encrypted_master_key,
+        'e2ee_salt': user.get('e2ee_salt')
+    })
+
+
+@app.route('/api/opaque/change_password/get_server_response', methods=['POST'])
+@rate_limit
+@login_required
+def opaque_change_password_get_server_response(user, data):
+    registration_request = base64.b64decode(data.get('registration_request'))
+    if not registration_request:
+        return jsonify({'success': False, 'error': 'Не указан registration_request'})
+    server_setup = opaque_ke_py.ServerSetupData.from_bytes(SERVER_SETUP_BYTES)
+    server_reg_start = opaque_ke_py.server_registration_start(
+        server_setup,
+        registration_request,
+        user['login'].encode('utf-8')
+    )
+    server_response = server_reg_start.get_message()
+    return jsonify({
+        'success': True,
+        'server_response': base64.b64encode(server_response).decode('utf-8')
+    })
+
+
+@app.route('/api/opaque/change_password/upload', methods=['POST'])
+@rate_limit
+@login_required
+def opaque_change_password_upload(user, data):
+    registration_upload = base64.b64decode(data.get('registration_upload'))
+    encrypted_master_key = data.get('encrypted_master_key')
+    if not registration_upload:
+        return jsonify({'success': False, 'error': 'Не указан registration_upload'})
+    server_reg_finish = opaque_ke_py.server_registration_finish(registration_upload)
+    new_password_file = server_reg_finish.get_password_file()
+    db.save_opaque_password_file(user['login'], new_password_file)
+    if encrypted_master_key:
+        db.save_encrypted_master_key(user['login'], encrypted_master_key)
+    current_session = None
+    session_token = request.headers.get('X-Session-Token')
+    if session_token:
+        current_session = verify_session_token(session_token, user['user_id'])
+    if current_session:
+        db.deactivate_all_sessions_except(user['user_id'], current_session)
+    else:
+        user_token = request.headers.get('X-User-Token')
         if user_token:
-            self.db.update_session_last_used(user_token)
+            db.deactivate_all_sessions_except(user['user_id'], user_token)
+    return jsonify({'success': True})
 
-        return {
-            'success': True,
-            'user_id': user['user_id'],
-            'username': user['username'],
-            'avatar': user['avatar'] if user['avatar'] else None,
+
+@app.route('/api/auth', methods=['POST'])
+@rate_limit
+@login_required
+def auth(user, data):
+    return jsonify({'success': True, 'message': 'Аутентификация успешна'})
+
+
+@app.route('/api/logout_current', methods=['POST'])
+@rate_limit
+@login_required
+def logout_current(user, data):
+    session_token = request.headers.get('X-Session-Token')
+    session_id = None
+    if session_token:
+        session_id = verify_session_token(session_token, user['user_id'])
+    if session_id:
+        db.deactivate_session(session_id, user['user_id'])
+    else:
+        user_token = request.headers.get('X-User-Token')
+        if user_token:
+            db.deactivate_session(user_token, user['user_id'])
+    remove_event_queue(user['user_id'])
+    return jsonify({'success': True})
+
+
+@app.route('/api/info', methods=['GET', 'POST'])
+@rate_limit
+@login_required
+def info(user, data):
+    if request.method == 'GET':
+        include_avatar = request.args.get('include_avatar', 'false').lower() == 'true'
+    else:
+        include_avatar = data.get('include_avatar', False)
+    avatar_version = db.get_user_avatar_version(user['user_id'])
+    response = {
+        'success': True,
+        'user_id': user['user_id'],
+        'username': user['username'],
+        'avatar_version': avatar_version
+    }
+    if include_avatar:
+        avatar_data = db.get_avatar_data(user['user_id'])
+        if avatar_data:
+            response['avatar'] = base64.b64encode(avatar_data).decode('utf-8')
+    return jsonify(response)
+
+
+@app.route('/api/get_sessions', methods=['POST'])
+@rate_limit
+@login_required
+def get_sessions(user, data):
+    sessions = db.get_user_sessions(user['user_id'])
+    current_session = request.headers.get('X-User-Token') or verify_session_token(
+        request.headers.get('X-Session-Token'), user['user_id']) if request.headers.get('X-Session-Token') else None
+    formatted = []
+    for s in sessions:
+        expires_at = datetime.datetime.fromisoformat(s['expires_at'])
+        expires_in = max(0, (expires_at - datetime.datetime.now()).total_seconds())
+        formatted.append({
+            'session_id': s['session_id'],
+            'created_at': s['created_at'],
+            'last_used_at': s['last_used_at'],
+            'expires_at': s['expires_at'],
+            'expires_in': int(expires_in),
+            'is_active': bool(s['is_active']),
+            'is_current': s['session_id'] == current_session
+        })
+    return jsonify({'success': True, 'sessions': formatted})
+
+
+@app.route('/api/logout_session', methods=['POST'])
+@rate_limit
+@login_required
+def logout_session(user, data):
+    target = data.get('target_session_id')
+    if not target:
+        return jsonify({'success': False, 'error': 'Не указана сессия'})
+    db.deactivate_session(target, user['user_id'])
+    return jsonify({'success': True})
+
+
+@app.route('/api/logout_all_sessions', methods=['POST'])
+@rate_limit
+@login_required
+def logout_all_sessions(user, data):
+    current = request.headers.get('X-User-Token') or verify_session_token(request.headers.get('X-Session-Token'),
+                                                                          user['user_id']) if request.headers.get(
+        'X-Session-Token') else None
+    if current:
+        db.deactivate_all_sessions_except(user['user_id'], current)
+    else:
+        db.deactivate_all_sessions(user['user_id'])
+    return jsonify({'success': True})
+
+
+@app.route('/api/get_cleanup_interval', methods=['POST'])
+@rate_limit
+@login_required
+def get_cleanup_interval(user, data):
+    interval = db.get_cleanup_interval(user['user_id'])
+    return jsonify({'success': True, 'cleanup_interval': interval})
+
+
+@app.route('/api/set_cleanup_interval', methods=['POST'])
+@rate_limit
+@login_required
+def set_cleanup_interval(user, data):
+    interval = data.get('interval')
+    if interval is None or interval < 0:
+        return jsonify({'success': False, 'error': 'Интервал не может быть отрицательным'})
+    db.set_cleanup_interval(user['user_id'], interval)
+    return jsonify({'success': True})
+
+
+@app.route('/api/search_users', methods=['POST'])
+@rate_limit
+@login_required
+def search_users(user, data):
+    query = data.get('search_query', '').strip()
+    if not query:
+        return jsonify({'success': True, 'users': []})
+    users = db.search_users(query, user['login'])
+    return jsonify({'success': True, 'users': users})
+
+
+@app.route('/api/get_user_info', methods=['POST'])
+@rate_limit
+@login_required
+def get_user_info(user, data):
+    target = data.get('target_login')
+    if not target:
+        return jsonify({'success': False, 'error': 'Не указан логин'})
+    target_user = db.get_user_by_login(target)
+    if not target_user:
+        return jsonify({'success': False, 'error': 'Пользователь не найден'})
+    is_contact = db.is_contact(user['login'], target)
+    return jsonify({
+        'success': True,
+        'user': {
+            'login': target_user['login'],
+            'username': target_user['username'],
+            'user_id': target_user['user_id'],
+            'avatar_version': target_user['avatar_version'],
+            'is_contact': is_contact
         }
+    })
 
-    def handle_get_sessions(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
+@app.route('/api/opaque/login/failed', methods=['POST'])
+@rate_limit
+def opaque_login_failed():
+    data = request.get_json()
+    login = data.get('login')
+    device_id = request.headers.get('X-Device-ID')
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+    if not login or not device_id:
+        return jsonify({'success': False, 'error': 'Не указан логин или device ID'}), 400
 
-        sessions = self.db.get_user_sessions(user_id)
+    db.increment_login_attempt(login, device_id)
+    blocked, seconds = db.is_login_blocked(login, device_id)
+    if blocked:
+        return jsonify({
+            'success': False,
+            'error': f'Слишком много попыток. Попробуйте через {seconds} секунд.',
+            'blocked': True,
+            'seconds': seconds
+        }), 429
 
-        formatted_sessions = []
-        for session in sessions:
-            formatted_sessions.append({
-                'session_id': session['session_id'],
-                'created_at': session['created_at'],
-                'last_used_at': session['last_used_at'],
-                'is_active': bool(session['is_active']),
-                'is_current': session['session_id'] == user_token
-            })
+    return jsonify({'success': True})
+@app.route('/api/upload_file', methods=['POST'])
+@rate_limit
+@login_required
+def upload_file(user, data):
+    file_data = data.get('file_data')
+    file_name = data.get('file_name')
+    file_type = data.get('file_type')
+    is_image_only = data.get('is_image_only', False)
+    encrypted_key = data.get('encrypted_key')
+    nonce_file = data.get('nonce_file')
+    thumbnail = data.get('thumbnail')
+    nonce_thumbnail = data.get('nonce_thumbnail')
+    is_encrypted = data.get('is_encrypted', 0)
 
-        return {
-            'success': True,
-            'sessions': formatted_sessions
-        }
+    if not file_data or not file_name or not file_type:
+        return jsonify({'success': False, 'error': 'Missing file data'})
 
-    def handle_logout_session(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
-        target_session_id = data.get('target_session_id')
+    file_bytes = base64.b64decode(file_data)
+    thumb_bytes = base64.b64decode(thumbnail) if thumbnail else None
+    success, result = db.save_file(
+        file_bytes, file_name, file_type, user['login'],
+        is_image_only=is_image_only,
+        encrypted_key=encrypted_key,
+        nonce_file=nonce_file,
+        thumbnail_data=thumb_bytes,
+        nonce_thumbnail=nonce_thumbnail
+    )
+    if success:
+        return jsonify({'success': True, 'file_id': result})
+    else:
+        return jsonify({'success': False, 'error': result})
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+@app.route('/api/get_file', methods=['POST'])
+@rate_limit
+@login_required
+def get_file(user, data):
+    file_id = data.get('file_id')
+    include_data = data.get('include_data', True)
+    include_thumbnail = data.get('include_thumbnail', False)
+    if not file_id:
+        return jsonify({'success': False, 'error': 'Missing file_id'})
 
-        if not target_session_id:
-            return {'success': False, 'error': 'Не указана сессия для выхода'}
+    file = db.get_file(file_id)
+    if not file:
+        return jsonify({'success': False, 'error': 'File not found'})
 
-        self.db.deactivate_session(target_session_id, user_id)
+    response = {
+        'success': True,
+        'file_id': file['id'],
+        'file_name': file['file_name'],
+        'file_type': file['file_type'],
+        'file_size': file['file_size'],
+        'is_image_only': bool(file['is_image_only']),
+        'is_encrypted': bool(file['is_encrypted']),
+        'encrypted_key': file['encrypted_key'],
+        'nonce_file': file['nonce_file'],
+        'nonce_thumbnail': file['nonce_thumbnail']
+    }
 
-        return {'success': True}
+    if include_data and file['file_data']:
+        response['file_data'] = base64.b64encode(file['file_data']).decode('utf-8')
+    if include_thumbnail and file.get('thumbnail_data'):
+        response['thumbnail'] = base64.b64encode(file['thumbnail_data']).decode('utf-8')
 
-    def handle_logout_all_sessions(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
+    return jsonify(response)
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+@app.route('/api/upload_encrypted_file', methods=['POST'])
+@rate_limit
+@login_required
+def upload_encrypted_file(user, data):
+    encrypted_file = data.get('encrypted_file')
+    encrypted_thumbnail = data.get('encrypted_thumbnail')
+    file_name = data.get('file_name')
+    file_type = data.get('file_type')
+    file_size = data.get('file_size')
+    nonce = data.get('nonce')
+    if not encrypted_file or not file_name or not file_type:
+        return jsonify({'success': False, 'error': 'Missing file data'})
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO files (file_name, file_type, file_size, file_data, thumbnail_data, uploaded_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (file_name, file_type, file_size, encrypted_file, encrypted_thumbnail, user['login']))
+    file_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'file_id': file_id})
 
-        self.db.deactivate_all_sessions_except(user_id, user_token)
 
-        return {'success': True}
+@app.route('/api/get_encrypted_file', methods=['POST'])
+@rate_limit
+@login_required
+def get_encrypted_file(user, data):
+    file_id = data.get('file_id')
+    include_thumbnail = data.get('include_thumbnail', False)
+    if not file_id:
+        return jsonify({'success': False, 'error': 'Missing file_id'}), 400
 
-    def handle_get_cleanup_interval(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
+    file = db.get_file(file_id)
+    if not file:
+        return jsonify({'success': False, 'error': 'File not found'}), 404
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
+    if not file['file_data']:
+        return jsonify({'success': False, 'error': 'File data is empty'}), 500
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
+    response = {
+        'success': True,
+        'file_id': file['id'],
+        'file_name': file['file_name'],
+        'file_type': file['file_type'],
+        'file_size': file['file_size'],
+        'encrypted_file': file['file_data']
+    }
+    if include_thumbnail and file.get('thumbnail_data'):
+        response['encrypted_thumbnail'] = file['thumbnail_data']
+    return jsonify(response)
 
-        interval = self.db.get_cleanup_interval(user_id)
 
-        return {
-            'success': True,
-            'cleanup_interval': interval
-        }
+@app.route('/api/send_message', methods=['POST'])
+@rate_limit
+@login_required
+def send_message(user, data):
+    receiver = data.get('receiver_login')
+    text = data.get('text', '')
+    file_id = data.get('file_id')
+    client_timestamp = data.get('client_timestamp')
+    nonce = data.get('nonce')
 
-    def handle_set_cleanup_interval(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
-        interval = data.get('interval')
+    if not receiver:
+        return jsonify({'success': False, 'error': 'Не указан получатель'})
+    if not text and not file_id:
+        return jsonify({'success': False, 'error': 'Пустое сообщение'})
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
+    receiver_user = db.get_user_by_login(receiver)
+    if not receiver_user:
+        return jsonify({'success': False, 'error': 'Получатель не найден'})
 
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        if interval < 0:
-            return {'success': False, 'error': 'Интервал не может быть отрицательным'}
-
-        self.db.set_cleanup_interval(user_id, interval)
-
-        return {'success': True}
-
-    def handle_search_users(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        search_query = data.get('search_query', '').strip()
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        if not search_query:
-            return {'success': True, 'users': []}
-
-        query = '''
-            select login, username 
-            from users 
-            where (login like ? or username like ?) 
-            and login != ?
-            limit 20
-        '''
-        search_pattern = f"%{search_query}%"
-        users = self.db.execute_query(query, (search_pattern, search_pattern, user['login']))
-
-        return {
-            'success': True,
-            'users': users if users else []
-        }
-
-    def handle_get_user_info(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        target_login = data.get('target_login')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        if not target_login:
-            return {'success': False, 'error': 'Не указан логин пользователя'}
-
-        result = self.db.execute_query(
-            'select login, username from users where login = ?',
-            (target_login,)
-        )
-
-        if not result:
-            return {'success': False, 'error': 'Пользователь не найден'}
-
-        target_user = result[0]
-
-        contact_result = self.db.execute_query(
-            'select * from contacts where contact_owner = ? and contact_login = ?',
-            (user['login'], target_login)
-        )
-
-        is_contact = bool(contact_result)
-
-        return {
-            'success': True,
-            'user': {
-                'login': target_user['login'],
-                'username': target_user['username'],
-                'is_contact': is_contact
+    msg = db.send_message(user['login'], receiver, text, file_id, client_timestamp, nonce)
+    file_info = None
+    if file_id:
+        file = db.get_file(file_id)
+        if file:
+            file_info = {
+                'id': file['id'],
+                'name': file['file_name'],
+                'type': file['file_type'],
+                'size': file['file_size'],
+                'is_image_only': bool(file['is_image_only']),
+                'is_encrypted': bool(file['is_encrypted']),
+                'encrypted_key': file['encrypted_key'],
+                'nonce_file': file['nonce_file'],
+                'nonce_thumbnail': file['nonce_thumbnail']
             }
-        }
+    msg_with_file = dict(msg)
+    msg_with_file['file_info'] = file_info
+    add_event(receiver_user['user_id'], 'new_message', msg_with_file)
+    return jsonify({'success': True, 'message': msg_with_file})
 
-    def handle_send_message(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        receiver_login = data.get('receiver_login')
-        text = data.get('text')
-        session_token = data.get('session_token', '')
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        query = '''
-            insert into messages (sender_login, receiver_login, message_text)
-            values (?, ?, ?)
-        '''
-
-        if self.db.execute_update(query, (user['login'], receiver_login, text)):
-            return {'success': True}
-        else:
-            return {'success': False, 'error': 'Ошибка при отправке сообщения'}
-
-    def handle_get_messages(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        other_user_login = data.get('other_user_login')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        query = '''
-            select m.*, u.username as sender_name
-            from messages m
-            join users u on m.sender_login = u.login
-            where (m.sender_login = ? and m.receiver_login = ?) 
-               or (m.sender_login = ? and m.receiver_login = ?)
-            order by m.timestamp asc
-        '''
-
-        messages = self.db.execute_query(
-            query,
-            (user['login'], other_user_login, other_user_login, user['login'])
-        )
-
-        return {
-            'success': True,
-            'messages': messages if messages else []
-        }
-
-    def handle_update_profile(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        username = data.get('username')
-        avatar = data.get('avatar')
-        password = data.get('password')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        updates = []
-        params = []
-
-        if username:
-            result = self.db.execute_query(
-                'select * from users where username = ? and login != ?',
-                (username, user['login'])
-            )
-            if result:
-                return {'success': False, 'error': 'Имя пользователя уже занято'}
-            updates.append('username = ?')
-            params.append(username)
-
-        if avatar:
-            if len(avatar) > 1000000:
-                return {'success': False, 'error': 'Аватар слишком большой (максимум 1MB)'}
-            updates.append('avatar = ?')
-            params.append(avatar)
-
-        if password:
-            updates.append('password = ?')
-            params.append(password)
-
-            if not username and not avatar:
-                self.db.deactivate_all_sessions_except(user_id, user_token)
-
-        if updates:
-            params.extend([user['login']])
-            query = f'''
-                update users 
-                set {', '.join(updates)} 
-                where login = ?
-            '''
-            if self.db.execute_update(query, tuple(params)):
-                return {'success': True}
-            else:
-                return {'success': False, 'error': 'Ошибка при обновлении профиля'}
-
-        return {'success': True}
-
-    def handle_add_contact(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        contact_login = data.get('contact_login')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        result = self.db.execute_query(
-            'select * from users where login = ?',
-            (contact_login,)
-        )
-        if not result:
-            return {'success': False, 'error': 'Пользователь не найден'}
-
-        if contact_login == user['login']:
-            return {'success': False, 'error': 'Нельзя добавить самого себя'}
-
-        result = self.db.execute_query(
-            'select * from contacts where contact_owner = ? and contact_login = ?',
-            (user['login'], contact_login)
-        )
-        if result:
-            return {'success': False, 'error': 'Контакт уже добавлен'}
-
-        query = '''
-            insert into contacts (contact_owner, contact_login) 
-            values (?, ?)
-        '''
-
-        if self.db.execute_update(query, (user['login'], contact_login)):
-            return {'success': True}
-        else:
-            return {'success': False, 'error': 'Ошибка при добавлении контакта'}
-
-    def handle_get_contacts(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        query = '''
-            select u.login, u.username
-            from contacts c 
-            join users u on c.contact_login = u.login 
-            where c.contact_owner = ?
-            order by u.username
-        '''
-
-        contacts = self.db.execute_query(query, (user['login'],))
-
-        return {
-            'success': True,
-            'contacts': contacts if contacts else []
-        }
-
-    def handle_get_avatar(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        contact_login = data.get('contact_login')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        result = self.db.execute_query(
-            'select avatar from users where login = ?',
-            (contact_login,)
-        )
-
-        if result and result[0]['avatar']:
-            return {'success': True, 'avatar': result[0]['avatar']}
-        else:
-            default_avatar_path = AVATARS_DIR / 'default_avatar.jpg'
-            if default_avatar_path.exists():
-                with open(default_avatar_path, 'rb') as f:
-                    avatar_bytes = f.read()
-                avatar_base64 = base64.b64encode(avatar_bytes).decode('utf-8')
-                return {'success': True, 'avatar': avatar_base64}
-
-            return {'success': True, 'avatar': None}
-
-    def handle_save_contact_settings(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        contact_login = data.get('contact_login')
-        display_name = data.get('display_name')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        query = '''
-            insert or replace into contact_settings 
-            (user_login, contact_login, display_name)
-            values (?, ?, ?)
-        '''
-
-        if self.db.execute_update(query, (user['login'], contact_login, display_name)):
-            return {'success': True}
-        else:
-            return {'success': False, 'error': 'Ошибка при сохранении настроек'}
-
-    def handle_get_contact_settings(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        session_token = data.get('session_token', '')
-
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
-        else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        result = self.db.execute_query(
-            'select contact_login, display_name from contact_settings where user_login = ?',
-            (user['login'],)
-        )
-
-        settings = {}
-        if result:
-            for row in result:
-                settings[row['contact_login']] = {
-                    'display_name': row['display_name']
+@app.route('/api/get_messages', methods=['POST'])
+@rate_limit
+@login_required
+def get_messages(user, data):
+    other = data.get('other_user_login')
+    if not other:
+        return jsonify({'success': False, 'error': 'Не указан пользователь'})
+    messages = db.get_messages(user['login'], other)
+    for msg in messages:
+        if msg['has_file'] and msg['file_id']:
+            file = db.get_file(msg['file_id'])
+            if file:
+                msg['file_info'] = {
+                    'id': file['id'],
+                    'name': file['file_name'],
+                    'type': file['file_type'],
+                    'size': file['file_size'],
+                    'is_image_only': bool(file['is_image_only']),
+                    'is_encrypted': bool(file['is_encrypted']),
+                    'encrypted_key': file['encrypted_key'],
+                    'nonce_file': file['nonce_file'],
+                    'nonce_thumbnail': file['nonce_thumbnail']
                 }
+    return jsonify({'success': True, 'messages': messages})
 
-        return {'success': True, 'settings': settings}
 
-    def handle_remove_contact(self, data):
-        user_token = data.get('user_token')
-        user_id = data.get('user_id')
-        contact_login = data.get('contact_login')
-        session_token = data.get('session_token', '')
+@app.route('/api/get_messages_since', methods=['POST'])
+@rate_limit
+@login_required
+def get_messages_since(user, data):
+    contact_login = data.get('contact_login')
+    since_id = data.get('since_id', 0)
+    if not contact_login:
+        return jsonify({'success': False, 'error': 'Не указан контакт'})
+    messages = db.get_messages_since(user['login'], contact_login, since_id)
+    for msg in messages:
+        if msg['has_file'] and msg['file_id']:
+            file = db.get_file(msg['file_id'])
+            if file:
+                msg['file_info'] = {
+                    'id': file['id'],
+                    'name': file['file_name'],
+                    'type': file['file_type'],
+                    'size': file['file_size'],
+                    'is_image_only': bool(file['is_image_only']),
+                    'is_encrypted': bool(file['is_encrypted']),
+                    'encrypted_key': file['encrypted_key'],
+                    'nonce_file': file['nonce_file'],
+                    'nonce_thumbnail': file['nonce_thumbnail']
+                }
+    return jsonify({'success': True, 'messages': messages})
 
-        if session_token:
-            user = self.db.get_user_by_session_token(session_token, user_id)
+
+@app.route('/api/update_profile', methods=['POST'])
+@rate_limit
+@login_required
+def update_profile(user, data):
+    username = data.get('username')
+    avatar = data.get('avatar')
+    if username:
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM users WHERE username = ? AND login != ?', (username, user['login']))
+        if cur.fetchone():
+            conn.close()
+            return jsonify({'success': False, 'error': 'Имя пользователя уже занято'})
+        conn.close()
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET username = ? WHERE login = ?', (username, user['login']))
+        conn.commit()
+        conn.close()
+    if avatar:
+        avatar_bytes = base64.b64decode(avatar)
+        success, res = db.update_user_avatar(user['user_id'], avatar_bytes)
+        if not success:
+            return jsonify({'success': False, 'error': res})
+        avatar_version = res
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT contact_owner FROM contacts WHERE contact_login = ?', (user['login'],))
+        owners = cur.fetchall()
+        conn.close()
+        for owner in owners:
+            owner_user = db.get_user_by_login(owner[0])
+            if owner_user:
+                add_event(owner_user['user_id'], 'avatar_updated', {
+                    'user_id': user['user_id'],
+                    'new_version': avatar_version
+                })
+        avatar_data = db.get_avatar_data(user['user_id'])
+        if avatar_data:
+            return jsonify({
+                'success': True,
+                'avatar_version': avatar_version,
+                'avatar': base64.b64encode(avatar_data).decode('utf-8')
+            })
         else:
-            user = self.db.get_user_by_token(user_token, user_id)
-
-        if not user:
-            return {'success': False, 'error': 'Неверный токен или ID пользователя'}
-
-        query = '''
-            delete from contacts 
-            where contact_owner = ? and contact_login = ?
-        '''
-
-        if self.db.execute_update(query, (user['login'], contact_login)):
-            return {'success': True}
-        else:
-            return {'success': False, 'error': 'Ошибка при удалении контакта'}
+            return jsonify({'success': True, 'avatar_version': avatar_version})
+    return jsonify({'success': True})
 
 
-def handle_client(client_socket, address):
-    print(f"[+] Подключился клиент {address}")
+@app.route('/api/add_contact', methods=['POST'])
+@rate_limit
+@login_required
+def add_contact(user, data):
+    contact = data.get('contact_login')
+    if not contact:
+        return jsonify({'success': False, 'error': 'Не указан логин контакта'})
+    if contact == user['login']:
+        return jsonify({'success': False, 'error': 'Нельзя добавить самого себя'})
+    target = db.get_user_by_login(contact)
+    if not target:
+        return jsonify({'success': False, 'error': 'Пользователь не найден'})
+    if db.add_contact(user['login'], contact):
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'error': 'Контакт уже добавлен'})
 
-    handler = RequestHandler()
 
-    while True:
-        data = b""
+@app.route('/api/remove_contact', methods=['POST'])
+@rate_limit
+@login_required
+def remove_contact(user, data):
+    contact = data.get('contact_login')
+    if not contact:
+        return jsonify({'success': False, 'error': 'Не указан логин'})
+    db.remove_contact(user['login'], contact)
+    return jsonify({'success': True})
+
+
+@app.route('/api/get_contacts', methods=['POST'])
+@rate_limit
+@login_required
+def get_contacts(user, data):
+    contacts = db.get_contacts(user['login'])
+    return jsonify({'success': True, 'contacts': contacts})
+
+
+@app.route('/api/get_avatar_versions', methods=['POST'])
+@rate_limit
+@login_required
+def get_avatar_versions(user, data):
+    user_ids = data.get('user_ids', [])
+    versions = db.get_avatar_versions(user_ids)
+    return jsonify({'success': True, 'versions': versions})
+
+
+@app.route('/api/get_avatar', methods=['POST'])
+@rate_limit
+@login_required
+def get_avatar(user, data):
+    target_id = data.get('target_user_id')
+    if not target_id:
+        return jsonify({'success': False, 'error': 'Не указан ID'})
+    avatar_data = db.get_avatar_data(target_id)
+    if avatar_data:
+        return jsonify({
+            'success': True,
+            'avatar': base64.b64encode(avatar_data).decode('utf-8')
+        })
+    else:
+        return jsonify({'success': False, 'error': 'Аватар не найден'})
+
+
+@app.route('/api/save_contact_settings', methods=['POST'])
+@rate_limit
+@login_required
+def save_contact_settings(user, data):
+    contact = data.get('contact_login')
+    display_name = data.get('display_name')
+    if not contact:
+        return jsonify({'success': False, 'error': 'Не указан контакт'})
+    db.save_contact_settings(user['login'], contact, display_name)
+    return jsonify({'success': True})
+
+
+@app.route('/api/get_contact_settings', methods=['POST'])
+@rate_limit
+@login_required
+def get_contact_settings(user, data):
+    settings = db.get_contact_settings(user['login'])
+    return jsonify({'success': True, 'settings': settings})
+
+
+@app.route('/api/publish_public_key', methods=['POST'])
+@rate_limit
+@login_required
+def publish_public_key(user, data):
+    public_key = data.get('public_key')
+    signature = data.get('signature')
+    if not public_key or not signature:
+        return jsonify({'success': False, 'error': 'Missing public key or signature'})
+    db.save_user_public_key(user['user_id'], public_key, signature)
+    return jsonify({'success': True})
+
+
+@app.route('/api/get_public_key', methods=['POST'])
+@rate_limit
+@login_required
+def get_public_key(user, data):
+    contact_login = data.get('contact_login')
+    if not contact_login:
+        return jsonify({'success': False, 'error': 'Missing contact_login'})
+    contact = db.get_user_by_login(contact_login)
+    if not contact:
+        return jsonify({'success': False, 'error': 'Contact not found'})
+    key_data = db.get_user_public_key(contact['user_id'])
+    if key_data:
+        return jsonify({'success': True, 'public_key': key_data['public_key'], 'signature': key_data['signature']})
+    else:
+        return jsonify({'success': False, 'error': 'Public key not found'})
+
+
+@app.route('/api/events')
+@rate_limit
+def events():
+    session_token = request.headers.get('X-Session-Token')
+    user_id = request.headers.get('X-User-Id')
+    user_token = request.headers.get('X-User-Token')
+    device_id = request.headers.get('X-Device-ID')
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+    if not session_token and not user_token:
+        return jsonify({'success': False, 'error': 'Missing credentials'}), 401
+    if session_token and user_id:
+        session_id = verify_session_token(session_token, user_id)
+        if not session_id:
+            return jsonify({'success': False, 'error': 'Invalid token'}), 401
+        user = db.get_user_by_token(session_id, user_id)
+    elif user_token and user_id:
+        user = db.get_user_by_token(user_token, user_id)
+    else:
+        return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
+    if not user:
+        return jsonify({'success': False, 'error': 'User not found'}), 401
+    user_id = user['user_id']
+    q = get_event_queue(user_id)
+    if q is None:
+        with event_queues_lock:
+            if user_id not in event_queues:
+                event_queues[user_id] = queue.Queue()
+            q = event_queues[user_id]
+
+    def generate():
         while True:
-            chunk = client_socket.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            try:
-                request = json.loads(data.decode('utf-8'))
-                break
-            except:
-                continue
+            event_type, event_data = q.get(timeout=30)
+            yield f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
 
-        if not data:
-            break
-
-        response = handler.handle_request(data)
-
-        response_json = json.dumps(response)
-        client_socket.send(response_json.encode('utf-8'))
-
-    client_socket.close()
-    print(f"[-] Клиент {address} отключился")
-
-
-def start_server(host=SERVER_HOST, port=SERVER_PORT):
-    start_session_cleanup_timer()
-
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    server_socket.bind((host, port))
-    server_socket.listen(MAX_CONNECTIONS)
-    print(f"[*] Сервер запущен на {host}:{port}")
-    print(f"[*] Ожидание подключений...")
-
-    while True:
-        client_socket, address = server_socket.accept()
-
-        client_thread = threading.Thread(
-            target=handle_client,
-            args=(client_socket, address),
-            daemon=True
-        )
-        client_thread.start()
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 
 if __name__ == '__main__':
-    start_server()
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, ssl_context='adhoc')

@@ -1,74 +1,92 @@
-from PyQt6.QtWidgets import QWidget, QMessageBox
-from PyQt6 import uic
-import sys
-import os
+from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtCore import QObject, pyqtSlot, QUrl
 from pathlib import Path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from network import messenger_api
+import html
 
-from styles import style_input_field, style_login_button, style_reg_button
-from network import make_server_request
+
+class LoginBridge(QObject):
+    # -- мост для входа
+
+    def __init__(self, login_window):
+        super().__init__()
+        self.login_window = login_window
+
+    @pyqtSlot(str, str)
+    def login(self, login, password):
+        # - вход в систему
+        self.login_window.check_log(login, password)
+
+    @pyqtSlot()
+    def showRegister(self):
+        # - показать регистрацию
+        self.login_window.show_register_window()
 
 
 class LoginWindow(QWidget):
+    # -- окно входа
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
+        self.bridge = LoginBridge(self)
         self.init_ui()
 
     def init_ui(self):
-        current_dir = Path(__file__).parent
-        ui_path = str(current_dir / 'log_wind.ui')
-        self.widget = uic.loadUi(ui_path)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        self.widget.Log_Input1.setStyleSheet(style_input_field)
-        self.widget.Password_Input1.setStyleSheet(style_input_field)
-        self.widget.Login_Button.setStyleSheet(style_login_button)
-        self.widget.Reg_Button1.setStyleSheet(style_reg_button)
+        self.web_view = QWebEngineView()
+        self.web_view.setStyleSheet("border: none; background: transparent;")
 
-        self.widget.Login_Button.clicked.connect(self.check_log)
-        self.widget.Log_Input1.setPlaceholderText("Введите ваш логин")
+        self.channel = QWebChannel(self.web_view.page())
+        self.channel.registerObject("backend", self.bridge)
+        self.web_view.page().setWebChannel(self.channel)
 
-        self.widget.Password_Input1.setPlaceholderText("Введите ваш пароль")
-        self.widget.Reg_Button1.clicked.connect(self.show_register_window)
+        html_path = Path(__file__).parent / "log_wind1.html"
+        if html_path.exists():
+            self.web_view.setUrl(QUrl.fromLocalFile(str(html_path.absolute())))
+        else:
+            self.web_view.setHtml("""
+                <!DOCTYPE html>
+                <html>
+                <head><meta charset="UTF-8"><title>Ошибка</title></head>
+                <body style="font-family: Arial; padding: 20px;">
+                    <h2>Файл log_wind1.html не найден</h2>
+                </body>
+                </html>
+            """)
 
-    def check_log(self):
-        login = self.widget.Log_Input1.text()
-        password = self.widget.Password_Input1.text()
+        layout.addWidget(self.web_view)
 
+    def check_log(self, login, password):
         if not login or not password:
-            QMessageBox.warning(self, "Ошибка", "Заполните все поля!")
+            self.web_view.page().runJavaScript('showToast("Заполните все поля!", true);')
             return
 
-        response = make_server_request('login', {
-            'login': login,
-            'password': password
-        })
+        self.web_view.page().runJavaScript('setLoading(true);')
 
-        if response:
-            if response.get('success'):
-                required_fields = ['user_token', 'user_id', 'username']
-                missing_fields = [field for field in required_fields if field not in response]
-
-                if missing_fields:
-                    print(f"ERROR: {missing_fields}")
-                    QMessageBox.warning(self, "Ошибка",
-                                        f"Сервер вернул неполный ответ. Отсутствуют: {', '.join(missing_fields)}")
-                    return
-
+        def handle_login_response(response):
+            self.web_view.page().runJavaScript('setLoading(false);')
+            if response and response.get('success'):
                 self.main_window.user_token = response['user_token']
                 self.main_window.user_id = response['user_id']
                 self.main_window.username = response['username']
                 self.main_window.current_user = login
+                self.main_window.session_token = response['session_token']
+                messenger_api.set_user_credentials(response['session_token'], response['user_id'], login)
+                e2ee_salt = response.get('e2ee_salt')
+                if e2ee_salt:
+                    messenger_api.init_e2ee(password, e2ee_salt)
                 self.main_window.show_chat_window()
                 self.close()
             else:
-                error_msg = response.get('error', 'Неизвестная ошибка')
-                QMessageBox.warning(self, "Ошибка", error_msg)
-        else:
-            QMessageBox.warning(self, "Ошибка", "Ошибка соединения с сервером!")
+                error_msg = response.get('error', 'Неверный логин или пароль') if response else 'Ошибка соединения'
+                safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
+                self.web_view.page().runJavaScript(f'showToast("{safe_error}", true);')
+
+        messenger_api.opaque_login_async(login, password, handle_login_response)
 
     def show_register_window(self):
         self.main_window.show_register_window()
-
-    def get_widget(self):
-        return self.widget
