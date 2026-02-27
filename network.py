@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from datetime import datetime, timezone
 
-SERVER_URL = "https://5.35.80.248:5000"
+SERVER_URL = "https://155.212.145.154:5000"
 
 
 def gen_msg_master_key():
@@ -382,7 +382,7 @@ class NetworkManager(QObject):
     connection_status_changed = pyqtSignal(bool)
     avatar_updated = pyqtSignal(dict)
 
-    def __init__(self, host='5.35.80.248', port=5000):
+    def __init__(self, host='155.212.145.154', port=5000):
         super().__init__()
         self.host = host
         self.port = port
@@ -453,7 +453,7 @@ class NetworkManager(QObject):
 
 class MessengerAPI:
     # -- главный api для работы с сервером
-    def __init__(self, host='5.35.80.248', port=5000):
+    def __init__(self, host='155.212.145.154', port=5000):
         self.network_manager = NetworkManager(host, port)
         self.file_cache = None
         self.login_in_progress = False

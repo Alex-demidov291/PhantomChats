@@ -22,7 +22,7 @@ def adapt_datetime(dt):
 
 sqlite3.register_adapter(datetime.datetime, adapt_datetime)
 
-SERVER_HOST = '5.35.80.248'
+SERVER_HOST = '155.212.145.154'
 SERVER_PORT = 5000
 SECRET_KEY = secrets.token_hex(32).encode()
 TOKEN_LIFETIME = 86400
@@ -32,7 +32,7 @@ SERVER_SETUP_BYTES = SERVER_SETUP.to_bytes()
 
 request_log = defaultdict(list)
 request_lock = threading.Lock()
-RATE_LIMIT = 10
+RATE_LIMIT = 7
 RATE_PERIOD = 1
 BLOCK_ATTEMPTS = 8
 BLOCK_DURATION = 3600
