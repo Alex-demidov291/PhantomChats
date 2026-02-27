@@ -1,19 +1,21 @@
-import sqlite3
-import uuid
+import base64
 import datetime
 import hashlib
-import base64
 import hmac
-import secrets
-import json
-import threading
-import queue
-import time
-from collections import defaultdict
-from flask import Flask, request, jsonify, Response, stream_with_context
-from PIL import Image
 import io
+import json
+import queue
+import secrets
+import sqlite3
+import threading
+import time
+import uuid
+from collections import defaultdict
+
 import opaque_ke_py
+from PIL import Image
+from flask import Flask, request, jsonify, Response, stream_with_context
+import settings
 
 
 def adapt_datetime(dt):
@@ -22,8 +24,8 @@ def adapt_datetime(dt):
 
 sqlite3.register_adapter(datetime.datetime, adapt_datetime)
 
-SERVER_HOST = '155.212.145.154'
-SERVER_PORT = 5000
+SERVER_HOST = settings.SERVER_HOST
+SERVER_PORT = settings.RUNNING_PORT
 SECRET_KEY = secrets.token_hex(32).encode()
 TOKEN_LIFETIME = 86400
 app = Flask(__name__)
@@ -1211,6 +1213,8 @@ def opaque_login_failed():
         }), 429
 
     return jsonify({'success': True})
+
+
 @app.route('/api/upload_file', methods=['POST'])
 @rate_limit
 @login_required
@@ -1632,5 +1636,10 @@ def events():
     )
 
 
+@app.route('/', methods=['GET'])
+def health(user, data):
+    return 'Healthy aka running.'
+
+
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True, ssl_context='adhoc')
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)

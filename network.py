@@ -13,8 +13,9 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from datetime import datetime, timezone
+import settings
 
-SERVER_URL = "https://155.212.145.154:5000"
+SERVER_URL = settings.SERVER_URL
 
 
 def gen_msg_master_key():
