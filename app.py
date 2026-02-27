@@ -1637,7 +1637,7 @@ def events():
 
 
 @app.route('/', methods=['GET'])
-def health(user, data):
+def health():
     return 'Healthy aka running.'
 
 
