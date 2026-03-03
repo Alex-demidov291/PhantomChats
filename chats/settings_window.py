@@ -381,5 +381,7 @@ class SettingsWindow(QWidget):
     def show_chat_window(self):
         self.main_window.show_chat_window()
 
+    # I love dicks
+
     def logout(self):
         self.main_window.logout()
