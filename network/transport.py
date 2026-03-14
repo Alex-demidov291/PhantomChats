@@ -1,0 +1,118 @@
+import json
+from PyQt6.QtCore import QObject, pyqtSignal, QUrl, QTimer, QByteArray, QEventLoop
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from network.config import SERVER_URL
+
+
+class SSEListener(QObject):
+    # -- слушатель событий от сервера
+    message_received = pyqtSignal(dict)
+    avatar_updated = pyqtSignal(dict)
+    connection_status = pyqtSignal(bool)
+
+    def __init__(self, session_token, user_id, user_login):
+        super().__init__()
+        self.session_token = session_token
+        self.user_id = user_id
+        self.user_login = user_login
+        self.nam = QNetworkAccessManager()
+        self.reply = None
+        self.buffer = b""
+        self.active = False
+
+    def start(self):
+        self.active = True
+        url = QUrl(f"{SERVER_URL}/api/events")
+        request = QNetworkRequest(url)
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "text/event-stream")
+        request.setRawHeader(b"X-User-Id", str(self.user_id).encode())
+        request.setRawHeader(b"X-Session-Token", self.session_token.encode())
+        from network.api import messenger_api
+        if messenger_api and messenger_api.device_id:
+            request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
+        request.setAttribute(QNetworkRequest.Attribute.CacheLoadControlAttribute,
+                             QNetworkRequest.CacheLoadControl.AlwaysNetwork)
+        self.reply = self.nam.get(request)
+        self.reply.sslErrors.connect(self.reply.ignoreSslErrors)
+        self.reply.readyRead.connect(self._on_ready_read)
+        self.reply.finished.connect(self._on_finished)
+        self.connection_status.emit(True)
+
+    def stop(self):
+        self.active = False
+        if self.reply:
+            self.reply.abort()
+            self.reply.deleteLater()
+            self.reply = None
+
+    def _on_ready_read(self):
+        if not self.reply:
+            return
+        data = self.reply.readAll().data()
+        self.buffer += data
+        while b"\n\n" in self.buffer:
+            part, self.buffer = self.buffer.split(b"\n\n", 1)
+            self._parse_sse_event(part)
+
+    def _parse_sse_event(self, chunk):
+        lines = chunk.decode('utf-8', errors='ignore').split('\n')
+        event_type = None
+        data = None
+        for line in lines:
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                data = line[5:].strip()
+        if data and event_type:
+            json_data = json.loads(data)
+            if event_type == 'new_message':
+                self.message_received.emit(json_data)
+            elif event_type == 'avatar_updated':
+                self.avatar_updated.emit(json_data)
+
+    def _on_finished(self):
+        if self.active:
+            self.connection_status.emit(False)
+            QTimer.singleShot(1000, self.start)
+
+
+class SyncHTTPRequest:
+    # -- синхронный https запрос
+    @staticmethod
+    def post(endpoint, data=None):
+        url = QUrl(f"{SERVER_URL}/api/{endpoint}")
+        request = QNetworkRequest(url)
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        from network.api import messenger_api
+        if messenger_api and messenger_api.device_id:
+            request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
+        if data:
+            if 'session_token' in data:
+                request.setRawHeader(b"X-Session-Token", str(data['session_token']).encode())
+                del data['session_token']
+            if 'user_id' in data:
+                request.setRawHeader(b"X-User-Id", str(data['user_id']).encode())
+                del data['user_id']
+            if 'user_token' in data:
+                request.setRawHeader(b"X-User-Token", str(data['user_token']).encode())
+                del data['user_token']
+        json_data = QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8')) if data else QByteArray()
+        nam = QNetworkAccessManager()
+        reply = nam.post(request, json_data)
+        reply.sslErrors.connect(reply.ignoreSslErrors)
+        loop = QEventLoop()
+        reply.finished.connect(loop.quit)
+        loop.exec()
+
+        status_code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if status_code and status_code != 200:
+            response_data = reply.readAll().data()
+            json_response = json.loads(response_data)
+            error_msg = json_response.get('error', f'HTTPS ошибка {status_code}')
+            return {'success': False, 'error': error_msg}
+
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            return {'success': False, 'error': reply.errorString()}
+
+        response_data = reply.readAll().data()
+        return json.loads(response_data)

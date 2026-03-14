@@ -1,0 +1,1 @@
+SERVER_URL = "https://phantomchats.ibashlhr.beget.tech"
