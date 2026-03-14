@@ -274,7 +274,7 @@ QInputDialog QPushButton:hover {
 """
 
 SERVER_URL = "https://5.35.80.248:5000/api"
-angle_alf = "abcdefghijklmnopqrstuvwxyz@!#*?"
+angle_alf = "abcdefghijklmnopqrstuvwxyz"
 numbers = "1234567890"
 from pathlib import Path
 script_dir = Path(__file__).parent
