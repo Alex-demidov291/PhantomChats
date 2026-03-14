@@ -4,6 +4,7 @@ from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import QObject, pyqtSlot, QUrl
 from pathlib import Path
 from network import messenger_api
+from utils import BASE_PATH
 import html
 
 
@@ -43,7 +44,7 @@ class RegisterWindow(QWidget):
         self.channel.registerObject("backend", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
 
-        html_path = Path(__file__).parent / "reg_wind1.html"
+        html_path = Path(BASE_PATH) / "authorization" / "reg_wind1.html"
         if html_path.exists():
             self.web_view.setUrl(QUrl.fromLocalFile(str(html_path.absolute())))
         else:

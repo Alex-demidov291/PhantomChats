@@ -16,6 +16,7 @@ from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import QByteArray, QBuffer
 
+from utils import BASE_PATH
 from network import make_server_request_async, messenger_api, Contact
 import markdown
 import base64
@@ -84,7 +85,8 @@ class MessageCache:
     #  -- кэш сообщений
     def __init__(self, user_id):
         self.user_id = user_id
-        self.cache_dir = Path(f'chats_save/{user_id}')
+        from utils import DATA_PATH
+        self.cache_dir = DATA_PATH / 'chats_save' / str(user_id)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_contact_file(self, contact_login):
@@ -143,7 +145,7 @@ class ChatWindow(QWidget):
         self.cur_contact = None
         self.contacts = {}
         self.contact_avatars = {}
-        self.script_dir = Path(__file__).parent.parent
+        self.script_dir = Path(BASE_PATH)
         self.page_loaded = False
         self.e2ee_ready = False
 

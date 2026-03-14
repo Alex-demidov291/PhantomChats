@@ -5,7 +5,7 @@ from PyQt6.QtCore import QObject, pyqtSlot, QUrl
 from pathlib import Path
 from network import messenger_api
 import html
-
+from utils import BASE_PATH
 
 class LoginBridge(QObject):
     # -- мост для входа
@@ -44,7 +44,7 @@ class LoginWindow(QWidget):
         self.channel.registerObject("backend", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
 
-        html_path = Path(__file__).parent / "log_wind1.html"
+        html_path = Path(BASE_PATH) / "authorization" / "log_wind1.html"
         if html_path.exists():
             self.web_view.setUrl(QUrl.fromLocalFile(str(html_path.absolute())))
         else:

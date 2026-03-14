@@ -8,7 +8,8 @@ class FileCache:
     # -- кэш для файлов
     def __init__(self, user_id):
         self.user_id = user_id
-        self.cache_dir = Path(f'files_cache/{user_id}')
+        from utils import DATA_PATH
+        self.cache_dir = DATA_PATH / 'files_cache' / str(user_id)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.cache_dir / 'metadata.json'
         self.metadata = self.load_metadata()

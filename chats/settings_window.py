@@ -13,7 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from styles import defult_ava, angle_alf, numbers
 from network import make_server_request_async, messenger_api
-
+from utils import BASE_PATH
 
 class SettingsBridge(QObject):
     # -- мост для связи с html
@@ -85,7 +85,7 @@ class SettingsWindow(QWidget):
         self.cur_ava_path = defult_ava
         self.bridge = SettingsBridge(self)
         self.init_ui()
-        self.script_dir = Path(__file__).parent.parent
+        self.script_dir = Path(BASE_PATH)
 
     def init_ui(self):
         layout = QVBoxLayout(self)

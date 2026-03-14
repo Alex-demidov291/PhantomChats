@@ -1,12 +1,8 @@
-from PyQt6.QtWidgets import QApplication, QMainWindow
+import PyQt6.QtWebEngineWidgets
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox
+from PyQt6.QtCore import QSettings
 from network import make_server_request_async, messenger_api
 from styles import style_input_dialog
-from authorization.login_window import LoginWindow
-from authorization.register_window import RegisterWindow
-from chats.chat_window import ChatWindow
-from chats.settings_window import SettingsWindow
-from PyQt6.QtWidgets import QMessageBox
-from PyQt6.QtCore import QSettings
 import sys
 import traceback
 import shutil
@@ -58,6 +54,7 @@ class MainWindow(QMainWindow):
         return cur_size.width() == 470 and cur_size.height() == 570
 
     def show_login_window(self):
+        from authorization.login_window import LoginWindow
         self.save_window_state()
         self._clear_cur_widget()
         self.login_window = LoginWindow(self)
@@ -66,6 +63,7 @@ class MainWindow(QMainWindow):
         self.restore_window_state((470, 570))
 
     def show_register_window(self):
+        from authorization.register_window import RegisterWindow
         self.save_window_state()
         self._clear_cur_widget()
         self.register_window = RegisterWindow(self)
@@ -74,6 +72,7 @@ class MainWindow(QMainWindow):
         self.restore_window_state((500, 600))
 
     def show_chat_window(self):
+        from chats.chat_window import ChatWindow
         if self.navigation_lock:
             return
         self.navigation_lock = True
@@ -108,6 +107,7 @@ class MainWindow(QMainWindow):
         }, handle_auth_response)
 
     def show_settings_window(self):
+        from chats.settings_window import SettingsWindow
         if self.navigation_lock:
             return
         self.navigation_lock = True
@@ -139,8 +139,9 @@ class MainWindow(QMainWindow):
             }, lambda x: None)
 
         if hasattr(self, 'chat_window') and self.chat_window:
-            shutil.rmtree(Path(f'chats_save/{self.user_id}'), ignore_errors=True)
-            shutil.rmtree(Path(f'files_cache/{self.user_id}'), ignore_errors=True)
+            from utils import DATA_PATH
+            shutil.rmtree(DATA_PATH / 'chats_save' / str(self.user_id), ignore_errors=True)
+            shutil.rmtree(DATA_PATH / 'files_cache' / str(self.user_id), ignore_errors=True)
 
         self.current_user = None
         self.user_token = None

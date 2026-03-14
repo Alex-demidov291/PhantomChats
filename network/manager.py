@@ -19,7 +19,8 @@ class NetworkManager(QObject):
         self.user_id = None
         self.user_login = None
         self.sse_listener = None
-        self.avatars_dir = Path('avatars')
+        from utils import DATA_PATH
+        self.avatars_dir = DATA_PATH / 'avatars'
         self.avatars_dir.mkdir(exist_ok=True)
 
     def set_credentials(self, session_token=None, user_token=None, user_id=None, user_login=None):
