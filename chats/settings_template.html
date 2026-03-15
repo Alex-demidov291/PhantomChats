@@ -12,28 +12,11 @@
             font-family: 'Segoe UI', 'Roboto', system-ui, sans-serif;
         }
 
-        ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: #f0f0f0;
-            border-radius: 4px;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: #c0c0c0;
-            border-radius: 4px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: #a0a0a0;
-        }
-
-        ::-webkit-scrollbar-button {
-            display: none;
-        }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f0f0f0; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #c0c0c0; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #a0a0a0; }
+        ::-webkit-scrollbar-button { display: none; }
 
         body {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -48,23 +31,10 @@
         .settings-container {
             max-width: 800px;
             width: 100%;
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
+            background: #ffffff;
             border-radius: 30px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             overflow: hidden;
-            animation: slideUp 0.5s ease;
-        }
-
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
         }
 
         .header {
@@ -74,16 +44,8 @@
             text-align: center;
         }
 
-        .header h1 {
-            font-size: 28px;
-            font-weight: 600;
-            margin-bottom: 10px;
-        }
-
-        .header p {
-            opacity: 0.9;
-            font-size: 14px;
-        }
+        .header h1 { font-size: 28px; font-weight: 600; margin-bottom: 10px; }
+        .header p { opacity: 0.9; font-size: 14px; }
 
         .content {
             padding: 30px;
@@ -101,9 +63,7 @@
             border-radius: 20px;
         }
 
-        .avatar-wrapper {
-            position: relative;
-        }
+        .avatar-wrapper { position: relative; }
 
         .avatar {
             width: 140px;
@@ -112,19 +72,14 @@
             object-fit: cover;
             border: 4px solid white;
             box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
-            transition: transform 0.3s ease;
+            transition: box-shadow 0.15s ease;
         }
 
         .avatar:hover {
-            transform: scale(1.05);
+            box-shadow: 0 14px 40px rgba(102, 126, 234, 0.45);
         }
 
-        .avatar-label {
-            font-size: 18px;
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 10px;
-        }
+        .avatar-label { font-size: 18px; font-weight: 600; color: #333; margin-bottom: 10px; }
 
         .avatar-btn {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -135,22 +90,15 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: box-shadow 0.15s ease;
             box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
         }
 
         .avatar-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.45);
         }
 
-        .avatar-btn:active {
-            transform: translateY(0);
-        }
-
-        .section {
-            margin-bottom: 25px;
-        }
+        .section { margin-bottom: 25px; }
 
         .section-title {
             font-size: 18px;
@@ -174,7 +122,7 @@
             border: 2px solid #e0e0e0;
             border-radius: 25px;
             font-size: 14px;
-            transition: all 0.3s ease;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
             background: white;
         }
 
@@ -184,9 +132,7 @@
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
 
-        .input-field::placeholder {
-            color: #999;
-        }
+        .input-field::placeholder { color: #999; }
 
         .action-btn {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -197,17 +143,12 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: box-shadow 0.15s ease;
             white-space: nowrap;
         }
 
         .action-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
-        }
-
-        .action-btn:active {
-            transform: translateY(0);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
         }
 
         .session-buttons {
@@ -226,17 +167,13 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
         }
 
         .session-btn:hover {
             background: #667eea;
             color: white;
-            transform: translateY(-2px);
-        }
-
-        .session-btn:active {
-            transform: translateY(0);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
         }
 
         .nav-buttons {
@@ -255,12 +192,12 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: background-color 0.15s ease, box-shadow 0.15s ease;
         }
 
         .back-btn:hover {
             background: #218838;
-            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(40, 167, 69, 0.3);
         }
 
         .logout-btn {
@@ -273,30 +210,26 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: background-color 0.15s ease, box-shadow 0.15s ease;
         }
 
         .logout-btn:hover {
             background: #c82333;
-            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(220, 53, 69, 0.3);
         }
 
         .modal {
             display: none;
             position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
             background: rgba(0,0,0,0.5);
             justify-content: center;
             align-items: center;
             z-index: 1000;
         }
 
-        .modal.active {
-            display: flex;
-        }
+        .modal.active { display: flex; }
 
         .modal-content {
             background: white;
@@ -304,20 +237,8 @@
             border-radius: 20px;
             max-width: 600px;
             width: 90%;
-            animation: modalSlide 0.3s ease;
             transition: max-height 0.3s ease;
             overflow: visible;
-        }
-
-        @keyframes modalSlide {
-            from {
-                opacity: 0;
-                transform: translateY(-30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
         }
 
         .modal-header {
@@ -327,10 +248,7 @@
             margin-bottom: 20px;
         }
 
-        .modal-header h2 {
-            color: #333;
-            font-size: 20px;
-        }
+        .modal-header h2 { color: #333; font-size: 20px; }
 
         .close-btn {
             background: none;
@@ -338,12 +256,10 @@
             font-size: 24px;
             cursor: pointer;
             color: #999;
-            transition: color 0.3s ease;
+            transition: color 0.15s ease;
         }
 
-        .close-btn:hover {
-            color: #333;
-        }
+        .close-btn:hover { color: #333; }
 
         .session-list {
             list-style: none;
@@ -358,62 +274,21 @@
             border-radius: 10px;
             margin-bottom: 10px;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: background-color 0.15s ease, border-color 0.15s ease;
             background: white;
         }
 
-        .session-item:hover {
-            background: #f5f5f5;
-            border-color: #667eea;
-        }
+        .session-item:hover { background: #f5f5f5; border-color: #667eea; }
+        .session-item.selected { border: 3px solid #667eea; background: #f0f4ff; }
+        .session-item.current { background: #28a745; color: white; border-color: #28a745; }
+        .session-item.current:hover { background: #34ce57; }
+        .session-item.active { background: #667eea; color: white; border-color: #667eea; }
+        .session-item.active:hover { background: #7a8ff5; }
+        .session-item.inactive { background: #f0f0f0; color: #999; border-color: #dddddd; opacity: 0.7; }
+        .session-item.inactive:hover { background: #e0e0e0; color: #666; }
 
-        .session-item.selected {
-            border: 3px solid #667eea;
-            background: #f0f4ff;
-        }
-
-        .session-item.current {
-            background: #28a745;
-            color: white;
-            border-color: #28a745;
-        }
-
-        .session-item.current:hover {
-            background: #34ce57;
-        }
-
-        .session-item.active {
-            background: #667eea;
-            color: white;
-            border-color: #667eea;
-        }
-
-        .session-item.active:hover {
-            background: #7a8ff5;
-        }
-
-        .session-item.inactive {
-            background: #f0f0f0;
-            color: #999;
-            border-color: #dddddd;
-            opacity: 0.7;
-        }
-
-        .session-item.inactive:hover {
-            background: #e0e0e0;
-            color: #666;
-        }
-
-        .session-id {
-            font-weight: 600;
-            margin-bottom: 5px;
-        }
-
-        .session-details {
-            font-size: 12px;
-            color: inherit;
-            opacity: 0.8;
-        }
+        .session-id { font-weight: 600; margin-bottom: 5px; }
+        .session-details { font-size: 12px; color: inherit; opacity: 0.8; }
 
         .modal-buttons {
             display: flex;
@@ -430,48 +305,17 @@
             border-radius: 25px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: background-color 0.15s ease, box-shadow 0.15s ease;
         }
 
-        .modal-btn.primary {
-            background: #667eea;
-            color: white;
-        }
+        .modal-btn.primary { background: #667eea; color: white; }
+        .modal-btn.primary:hover { background: #5a6fd6; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3); }
+        .modal-btn.danger { background: #dc3545; color: white; }
+        .modal-btn.danger:hover { background: #c82333; box-shadow: 0 4px 12px rgba(220, 53, 69, 0.3); }
+        .modal-btn.secondary { background: #6c757d; color: white; }
+        .modal-btn.secondary:hover { background: #5a6268; }
 
-        .modal-btn.primary:hover {
-            background: #5a6fd6;
-            transform: translateY(-2px);
-        }
-
-        .modal-btn.danger {
-            background: #dc3545;
-            color: white;
-        }
-
-        .modal-btn.danger:hover {
-            background: #c82333;
-            transform: translateY(-2px);
-        }
-
-        .modal-btn.secondary {
-            background: #6c757d;
-            color: white;
-        }
-
-        .modal-btn.secondary:hover {
-            background: #5a6268;
-            transform: translateY(-2px);
-        }
-
-        .modal-btn:active {
-            transform: translateY(0);
-        }
-
-        .custom-select {
-            position: relative;
-            width: 100%;
-            margin: 15px 0;
-        }
+        .custom-select { position: relative; width: 100%; margin: 15px 0; }
 
         .select-selected {
             background: white;
@@ -484,33 +328,26 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            transition: all 0.3s ease;
+            transition: border-color 0.15s ease;
         }
 
-        .select-selected:hover {
-            border-color: #667eea;
-        }
+        .select-selected:hover { border-color: #667eea; }
 
         .select-selected:after {
             content: '';
-            width: 0;
-            height: 0;
+            width: 0; height: 0;
             border-left: 6px solid transparent;
             border-right: 6px solid transparent;
             border-top: 8px solid #667eea;
             margin-left: 10px;
-            transition: transform 0.3s ease;
+            transition: transform 0.2s ease;
         }
 
-        .select-selected.select-arrow-active:after {
-            transform: rotate(180deg);
-        }
+        .select-selected.select-arrow-active:after { transform: rotate(180deg); }
 
         .select-items {
             position: absolute;
-            top: 100%;
-            left: 0;
-            right: 0;
+            top: 100%; left: 0; right: 0;
             background: white;
             border: 2px solid #667eea;
             border-radius: 15px;
@@ -521,152 +358,53 @@
             box-shadow: 0 5px 20px rgba(0,0,0,0.2);
         }
 
-        .select-items.show {
-            display: block;
-        }
+        .select-items.show { display: block; }
 
         .select-item {
             padding: 12px 15px;
             cursor: pointer;
-            transition: all 0.2s ease;
+            transition: background-color 0.15s ease;
             border-bottom: 1px solid #f0f0f0;
         }
 
-        .select-item:last-child {
-            border-bottom: none;
-        }
+        .select-item:last-child { border-bottom: none; }
+        .select-item:hover { background: #f5f5f5; }
+        .select-item.selected { background: #667eea; color: white; }
+        .select-item.selected:hover { background: #5a6fd6; }
 
-        .select-item:hover {
-            background: #f5f5f5;
-        }
-
-        .select-item.selected {
-            background: #667eea;
-            color: white;
-        }
-
-        .select-item.selected:hover {
-            background: #5a6fd6;
-        }
-
-        .dropdown-container {
-            overflow: visible;
-            transition: all 0.3s ease;
-        }
+        .dropdown-container { overflow: visible; }
 
         .toast {
             position: fixed;
-            bottom: 30px;
-            right: 30px;
+            bottom: 30px; right: 30px;
             background: #28a745;
             color: white;
             padding: 15px 25px;
             border-radius: 50px;
             box-shadow: 0 5px 20px rgba(0,0,0,0.2);
-            animation: slideIn 0.3s ease;
             z-index: 1001;
         }
 
-        .toast.error {
-            background: #dc3545;
-        }
+        .toast.error { background: #dc3545; }
 
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        #confirmModal .modal-content {
-            animation: modalSlide 0.3s ease;
-            border-radius: 20px;
-            overflow: hidden;
-        }
-
+        #confirmModal .modal-content { border-radius: 20px; overflow: hidden; }
         #confirmModal .modal-header {
             background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
             padding: 20px;
             border-bottom: 1px solid #dee2e6;
         }
-
-        #confirmModal .modal-header h2 {
-            color: #495057;
-            font-size: 20px;
-            font-weight: 600;
-        }
-
-        #confirmModal .modal-buttons {
-            padding: 20px;
-            background: #f8f9fa;
-            border-top: 1px solid #dee2e6;
-        }
-
-        #confirmModal .modal-btn {
-            padding: 12px 25px;
-            font-size: 14px;
-            font-weight: 600;
-            border-radius: 25px;
-            transition: all 0.3s ease;
-        }
-
-        #confirmModal .modal-btn.danger {
-            background: #dc3545;
-            color: white;
-            border: none;
-        }
-
-        #confirmModal .modal-btn.danger:hover {
-            background: #c82333;
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(220, 53, 69, 0.3);
-        }
-
-        #confirmModal .modal-btn.secondary {
-            background: #6c757d;
-            color: white;
-            border: none;
-        }
-
-        #confirmModal .modal-btn.secondary:hover {
-            background: #5a6268;
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(108, 117, 125, 0.3);
-        }
+        #confirmModal .modal-header h2 { color: #495057; font-size: 20px; font-weight: 600; }
+        #confirmModal .modal-buttons { padding: 20px; background: #f8f9fa; border-top: 1px solid #dee2e6; }
+        #confirmModal .modal-btn { padding: 12px 25px; font-size: 14px; font-weight: 600; border-radius: 25px; }
 
         @media (max-width: 600px) {
-            .avatar-section {
-                flex-direction: column;
-                text-align: center;
-            }
-
-            .input-group {
-                flex-direction: column;
-            }
-
-            .input-field {
-                min-width: 100%;
-            }
-
-            .session-buttons {
-                flex-direction: column;
-            }
-
-            .nav-buttons {
-                flex-direction: column;
-            }
-
-            .modal-buttons {
-                flex-direction: column;
-            }
-
-            .modal-btn {
-                width: 100%;
-            }
+            .avatar-section { flex-direction: column; text-align: center; }
+            .input-group { flex-direction: column; }
+            .input-field { min-width: 100%; }
+            .session-buttons { flex-direction: column; }
+            .nav-buttons { flex-direction: column; }
+            .modal-buttons { flex-direction: column; }
+            .modal-btn { width: 100%; }
         }
     </style>
 </head>
@@ -723,8 +461,7 @@
                 <h2>Управление сессиями</h2>
                 <button class="close-btn" onclick="closeModal('sessionsModal')">&times;</button>
             </div>
-            <div id="sessionsList" class="session-list">
-            </div>
+            <div id="sessionsList" class="session-list"></div>
             <div class="modal-buttons">
                 <button class="modal-btn danger" onclick="logoutSelectedSession()">Завершить выбранную</button>
                 <button class="modal-btn danger" onclick="logoutAllSessions()">Завершить все</button>
@@ -740,7 +477,6 @@
                 <button class="close-btn" onclick="closeModal('cleanupModal')">&times;</button>
             </div>
             <p style="margin-bottom: 15px; color: #666;">Выберите интервал автоматической очистки завершенных сессий:</p>
-
             <div class="custom-select" id="cleanupSelect">
                 <div class="select-selected" onclick="toggleDropdown(event)">
                     <span id="selectedOption">Немедленно</span>
@@ -754,7 +490,6 @@
                     <div class="select-item" data-value="2592000" onclick="selectOption(this, event)">Каждый месяц (30 дней)</div>
                 </div>
             </div>
-
             <div class="modal-buttons">
                 <button class="modal-btn primary" onclick="saveCleanupSettings()">Сохранить</button>
                 <button class="modal-btn secondary" onclick="closeModal('cleanupModal')">Отмена</button>
@@ -802,9 +537,6 @@
         window.onload = function() {
             document.addEventListener('click', function(event) {
                 const select = document.getElementById('cleanupSelect');
-                const dropdown = document.getElementById('dropdownItems');
-                const selected = document.querySelector('.select-selected');
-
                 if (select && !select.contains(event.target) && isDropdownOpen) {
                     closeDropdown();
                 }
@@ -824,53 +556,35 @@
 
         function toggleDropdown(event) {
             event.stopPropagation();
-            const dropdown = document.getElementById('dropdownItems');
-            const selected = document.querySelector('.select-selected');
-
-            if (isDropdownOpen) {
-                closeDropdown();
-            } else {
-                openDropdown();
-            }
+            if (isDropdownOpen) { closeDropdown(); } else { openDropdown(); }
         }
 
         function openDropdown() {
             const dropdown = document.getElementById('dropdownItems');
             const selected = document.querySelector('.select-selected');
             const modalContent = document.getElementById('cleanupModalContent');
-
             dropdown.classList.add('show');
             selected.classList.add('select-arrow-active');
             isDropdownOpen = true;
-
-            const dropdownHeight = dropdown.scrollHeight;
-            modalContent.style.maxHeight = (modalContent.scrollHeight + dropdownHeight) + 'px';
+            modalContent.style.maxHeight = (modalContent.scrollHeight + dropdown.scrollHeight) + 'px';
         }
 
         function closeDropdown() {
             const dropdown = document.getElementById('dropdownItems');
             const selected = document.querySelector('.select-selected');
             const modalContent = document.getElementById('cleanupModalContent');
-
             dropdown.classList.remove('show');
             selected.classList.remove('select-arrow-active');
             isDropdownOpen = false;
-
             modalContent.style.maxHeight = '';
         }
 
         function selectOption(element, event) {
             event.stopPropagation();
-
-            document.querySelectorAll('.select-item').forEach(item => {
-                item.classList.remove('selected');
-            });
-
+            document.querySelectorAll('.select-item').forEach(item => item.classList.remove('selected'));
             element.classList.add('selected');
-
             document.getElementById('selectedOption').textContent = element.textContent;
             currentInterval = parseInt(element.getAttribute('data-value'));
-
             closeDropdown();
         }
 
@@ -879,80 +593,42 @@
             toast.textContent = message;
             toast.className = 'toast' + (isError ? ' error' : '');
             toast.style.display = 'block';
-            setTimeout(() => {
-                toast.style.display = 'none';
-            }, 3000);
+            setTimeout(() => { toast.style.display = 'none'; }, 3000);
         }
 
-        function changeAvatar() {
-            if (backend) backend.changeAvatar();
-        }
-
-        function changeName() {
-            const name = document.getElementById('nameInput').value.trim();
-            if (name && backend) backend.changeName(name);
-        }
-
-        function changePassword() {
-            const password = document.getElementById('passwordInput').value;
-            const confirm = document.getElementById('confirmPasswordInput').value;
-            if (backend) backend.changePassword(password, confirm);
-        }
-
-        function showSessions() {
-            if (backend) backend.showSessions();
-        }
-
-        function showCleanup() {
-            if (backend) backend.showCleanup();
-        }
-
-        function backToChat() {
-            if (backend) backend.backToChat();
-        }
-
-        function logout() {
-            if (backend) backend.logout();
-        }
+        function changeAvatar() { if (backend) backend.changeAvatar(); }
+        function changeName() { const name = document.getElementById('nameInput').value.trim(); if (name && backend) backend.changeName(name); }
+        function changePassword() { const p = document.getElementById('passwordInput').value; const c = document.getElementById('confirmPasswordInput').value; if (backend) backend.changePassword(p, c); }
+        function showSessions() { if (backend) backend.showSessions(); }
+        function showCleanup() { if (backend) backend.showCleanup(); }
+        function backToChat() { if (backend) backend.backToChat(); }
+        function logout() { if (backend) backend.logout(); }
 
         function updateSessionsList(sessionsData) {
             const list = document.getElementById('sessionsList');
             list.innerHTML = '';
             sessions = sessionsData;
             selectedSessionId = null;
-
             sessions.forEach(session => {
                 const item = document.createElement('div');
-                if (session.is_current) {
-                    item.className = 'session-item current';
-                } else if (session.is_active) {
-                    item.className = 'session-item active';
-                } else {
-                    item.className = 'session-item inactive';
-                }
-
+                if (session.is_current) { item.className = 'session-item current'; }
+                else if (session.is_active) { item.className = 'session-item active'; }
+                else { item.className = 'session-item inactive'; }
                 item.onclick = function(e) {
                     e.stopPropagation();
-                    document.querySelectorAll('.session-item').forEach(el => {
-                        el.classList.remove('selected');
-                    });
-
+                    document.querySelectorAll('.session-item').forEach(el => el.classList.remove('selected'));
                     this.classList.add('selected');
                     selectedSessionId = session.session_id;
                 };
-
                 const sessionId = document.createElement('div');
                 sessionId.className = 'session-id';
                 sessionId.textContent = session.session_id.substring(0, 8) + '...';
-
                 const created = session.created_at ? session.created_at.substring(0, 16) : 'неизвестно';
                 const lastUsed = session.last_used_at ? session.last_used_at.substring(0, 16) : 'неизвестно';
                 const status = session.is_current ? 'Текущая' : (session.is_active ? 'Активна' : 'Неактивна');
-
                 const details = document.createElement('div');
                 details.className = 'session-details';
                 details.textContent = `Создана: ${created} | Последняя активность: ${lastUsed} | ${status}`;
-
                 item.appendChild(sessionId);
                 item.appendChild(details);
                 list.appendChild(item);
@@ -960,43 +636,25 @@
         }
 
         function logoutSelectedSession() {
-            if (!selectedSessionId) {
-                showToast('Выберите сессию для завершения', true);
-                return;
-            }
-
+            if (!selectedSessionId) { showToast('Выберите сессию для завершения', true); return; }
             const session = sessions.find(s => s.session_id === selectedSessionId);
-            if (session && session.is_current) {
-                showToast('Нельзя завершить текущую сессию', true);
-                return;
-            }
-
+            if (session && session.is_current) { showToast('Нельзя завершить текущую сессию', true); return; }
             if (backend) backend.logoutSelectedSession(selectedSessionId);
         }
 
         function logoutAllSessions() {
-            showConfirmModal(
-                'Вы уверены, что хотите завершить все сессии кроме текущей?',
-                function() {
-                    if (backend) backend.logoutAllSessions();
-                }
-            );
+            showConfirmModal('Вы уверены, что хотите завершить все сессии кроме текущей?', function() {
+                if (backend) backend.logoutAllSessions();
+            });
         }
 
-        function openModal(modalId) {
-            document.getElementById(modalId).classList.add('active');
-        }
-
+        function openModal(modalId) { document.getElementById(modalId).classList.add('active'); }
         function closeModal(modalId) {
             document.getElementById(modalId).classList.remove('active');
-            if (modalId === 'cleanupModal' && isDropdownOpen) {
-                closeDropdown();
-            }
+            if (modalId === 'cleanupModal' && isDropdownOpen) closeDropdown();
         }
 
-        function saveCleanupSettings() {
-            if (backend) backend.saveCleanupSettings(currentInterval);
-        }
+        function saveCleanupSettings() { if (backend) backend.saveCleanupSettings(currentInterval); }
 
         function updateAvatar(imageBase64) {
             if (imageBase64 && imageBase64.length > 0) {
@@ -1006,14 +664,11 @@
             }
         }
 
-        function setUsername(username) {
-            document.getElementById('nameInput').value = username;
-        }
+        function setUsername(username) { document.getElementById('nameInput').value = username; }
 
         function setCleanupInterval(interval) {
             currentInterval = interval;
-            const options = document.querySelectorAll('.select-item');
-            options.forEach(option => {
+            document.querySelectorAll('.select-item').forEach(option => {
                 const value = parseInt(option.getAttribute('data-value'));
                 if (value === interval) {
                     option.classList.add('selected');
@@ -1029,10 +684,7 @@
             document.getElementById('confirmPasswordInput').value = '';
         }
 
-        function closeAllModals() {
-            closeModal('sessionsModal');
-            closeModal('cleanupModal');
-        }
+        function closeAllModals() { closeModal('sessionsModal'); closeModal('cleanupModal'); }
 
         function showConfirmModal(message, actionCallback) {
             document.getElementById('confirmMessage').textContent = message;
@@ -1040,17 +692,8 @@
             openModal('confirmModal');
         }
 
-        function closeConfirmModal() {
-            closeModal('confirmModal');
-            confirmAction = null;
-        }
-
-        function executeConfirmAction() {
-            if (confirmAction) {
-                confirmAction();
-            }
-            closeConfirmModal();
-        }
+        function closeConfirmModal() { closeModal('confirmModal'); confirmAction = null; }
+        function executeConfirmAction() { if (confirmAction) confirmAction(); closeConfirmModal(); }
     </script>
 </body>
 </html>

@@ -1,7 +1,8 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtCore import QObject, pyqtSlot, QUrl
+from PyQt6.QtCore import QObject, pyqtSlot, QUrl, Qt
 import sys
 import os
 import base64
@@ -13,7 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from styles import defult_ava, angle_alf, numbers
 from network import make_server_request_async, messenger_api
-from utils import BASE_PATH
+
 
 class SettingsBridge(QObject):
     # -- мост для связи с html
@@ -85,19 +86,24 @@ class SettingsWindow(QWidget):
         self.cur_ava_path = defult_ava
         self.bridge = SettingsBridge(self)
         self.init_ui()
-        self.script_dir = Path(BASE_PATH)
+        self.script_dir = Path(__file__).parent.parent
 
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.web_view = QWebEngineView()
-        self.web_view.setStyleSheet("border: none; background: #f5f5f5;")
+        self.web_view.setStyleSheet("border: none; background: #ffffff;")
+
+        ws = self.web_view.settings()
+        ws.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
 
         self.channel = QWebChannel(self.web_view.page())
         self.channel.registerObject("backend", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
+        self.web_view.page().setBackgroundColor(Qt.GlobalColor.white)
         self.web_view.setZoomFactor(0.87)
+
         html_path = Path(__file__).parent / "settings_template.html"
         if html_path.exists():
             self.web_view.setUrl(QUrl.fromLocalFile(str(html_path.absolute())))
@@ -196,7 +202,7 @@ class SettingsWindow(QWidget):
         if fname:
             with open(fname, 'rb') as f:
                 image_data = f.read()
-            if len(image_data) > 500 * 1024:
+            if len(image_data) > 150 * 1024:
                 self.web_view.page().runJavaScript('showToast("Изображение слишком большое (максимум 150KB)!", true);')
                 return
 
@@ -380,8 +386,6 @@ class SettingsWindow(QWidget):
 
     def show_chat_window(self):
         self.main_window.show_chat_window()
-
-    # I love dicks
 
     def logout(self):
         self.main_window.logout()

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QFileDialog
 from PyQt6.QtCore import QUrl, QTimer, QObject, pyqtSlot, Qt
 from PyQt6.QtWebChannel import QWebChannel
@@ -178,14 +179,18 @@ class ChatWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.web_view = QWebEngineView()
-        self.web_view.setStyleSheet("border: none; background: #f5f5f5;")
+        self.web_view.setStyleSheet("border: none; background: #ffffff;")
         self.web_view.loadFinished.connect(self.on_page_loaded)
         self.web_view.setZoomFactor(0.8)
+
+        ws = self.web_view.settings()
+        ws.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
 
         self.channel = QWebChannel(self.web_view.page())
         self.bridge = Bridge(self)
         self.channel.registerObject("qt", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
+        self.web_view.page().setBackgroundColor(Qt.GlobalColor.white)
 
         html_path = self.script_dir / "chats" / "messages.html"
         if html_path.exists():
@@ -413,10 +418,10 @@ class ChatWindow(QWidget):
         }, handle_file_response)
 
     def save_file_dialog(self, file_name, file_data):
+        from PyQt6.QtCore import QCoreApplication
         main_window = self.main_window
         main_window.activateWindow()
         main_window.raise_()
-        from PyQt6.QtCore import QCoreApplication
         QCoreApplication.processEvents()
 
         suffix = Path(file_name).suffix.lstrip('.')
@@ -425,12 +430,7 @@ class ChatWindow(QWidget):
         else:
             filter_str = "Все файлы (*)"
 
-        save_path, _ = QFileDialog.getSaveFileName(
-            main_window,
-            "Сохранить файл",
-            file_name,
-            filter_str
-        )
+        save_path, _ = QFileDialog.getSaveFileName(main_window, "Сохранить файл", file_name, filter_str)
 
         if save_path:
             with open(save_path, 'wb') as f:
@@ -440,8 +440,8 @@ class ChatWindow(QWidget):
             self.web_view.page().runJavaScript('showToast("Сохранение отменено");')
 
     def save_fullscreen_image(self, image_data, file_name):
+        import re
         if image_data.startswith('data:image'):
-            import re
             image_data = re.sub('^data:image/.+;base64,', '', image_data)
         file_bytes = base64.b64decode(image_data)
         self.save_file_dialog(file_name, file_bytes)
@@ -619,10 +619,9 @@ class ChatWindow(QWidget):
                 contact.update_avatar_check_time()
                 self.contacts[contact_data['login']] = contact
 
-            self.load_contact_avatars()
             self.load_contact_settings()
+            self.load_contact_avatars()
             self.sync_all_contacts()
-            self._update_contacts_js()
             self.load_user_data()
             self.preload_all_imgs()
 
@@ -673,7 +672,6 @@ class ChatWindow(QWidget):
         for contact_login in self.contacts:
             self.sync_contact_msgs(contact_login)
         self.preload_all_imgs()
-
 
     def _handle_messages_since_response(self, contact_login, response):
         if response and response.get('success'):

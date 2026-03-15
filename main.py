@@ -169,7 +169,13 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyleSheet(style_input_dialog)
+    from PyQt6.QtGui import QIcon
+    from utils import find_file
+    icon_path = find_file('images/icon_on_exe.ico')
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     messenger_api.init_device_id()
     window = MainWindow()
+    window.setWindowIcon(app.windowIcon())
     window.show()
     sys.exit(app.exec())
