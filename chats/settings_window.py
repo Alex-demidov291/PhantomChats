@@ -196,7 +196,7 @@ class SettingsWindow(QWidget):
         if fname:
             with open(fname, 'rb') as f:
                 image_data = f.read()
-            if len(image_data) > 150 * 1024:
+            if len(image_data) > 500 * 1024:
                 self.web_view.page().runJavaScript('showToast("Изображение слишком большое (максимум 150KB)!", true);')
                 return
 
