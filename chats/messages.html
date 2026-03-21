@@ -802,6 +802,13 @@
             cursor: pointer;
             color: #667eea;
         }
+        /* Индикатор загрузки контактов */
+        .loading-contacts {
+            text-align: center;
+            padding: 30px;
+            color: #999;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -811,7 +818,9 @@
             <h2>Phantom</h2>
             <input type="text" class="search-input" id="searchInput" placeholder="🔍 Поиск в контактах">
         </div>
-        <div class="contacts-list" id="contactsList"></div>
+        <div class="contacts-list" id="contactsList">
+            <div class="loading-contacts">Загрузка контактов...</div>
+        </div>
         <div class="left-footer">
             <button class="left-btn settings" onclick="showSettings()">⚙ Настройки</button>
             <button class="left-btn add" onclick="showAddContactModal()">➕ Добавить</button>
@@ -1170,12 +1179,15 @@
                     preview.setAttribute('data-file-name', fileInfo.name || 'file');
                     preview.setAttribute('data-file-type', fileInfo.type || 'application/octet-stream');
                     preview.setAttribute('data-file-size', fileInfo.size || 0);
-                    // Добавляем атрибуты для ключа и nonce
-                    if (fileInfo.file_key) {
-                        preview.setAttribute('data-file-key', fileInfo.file_key);
+                    preview.setAttribute('data-is-encrypted', fileInfo.is_encrypted ? '1' : '0');
+                    if (fileInfo.encrypted_key) {
+                        preview.setAttribute('data-encrypted-key', fileInfo.encrypted_key);
                     }
                     if (fileInfo.nonce_file) {
                         preview.setAttribute('data-nonce-file', fileInfo.nonce_file);
+                    }
+                    if (fileInfo.sender_login) {
+                        preview.setAttribute('data-sender-login', fileInfo.sender_login);
                     }
                     preview.onclick = () => downloadFile(preview);
                     const icon = document.createElement('span');
@@ -1323,8 +1335,10 @@
                 name: element.dataset.fileName,
                 type: element.dataset.fileType,
                 size: parseInt(element.dataset.fileSize),
-                file_key: element.dataset.fileKey,
-                nonce_file: element.dataset.nonceFile
+                is_encrypted: element.dataset.isEncrypted === '1',
+                encrypted_key: element.dataset.encryptedKey || null,
+                nonce_file: element.dataset.nonceFile || null,
+                sender_login: element.dataset.senderLogin || null
             };
             window.qt.downloadFile(fileInfo.id, JSON.stringify(fileInfo));
         }

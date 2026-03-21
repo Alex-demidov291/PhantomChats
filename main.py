@@ -51,7 +51,7 @@ class MainWindow(QMainWindow):
 
     def is_default_login_size(self):
         cur_size = self.size()
-        return cur_size.width() == 470 and cur_size.height() == 570
+        return cur_size.width() == 570 and cur_size.height() == 700
 
     def show_login_window(self):
         from authorization.login_window import LoginWindow
@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
         self.login_window = LoginWindow(self)
         self.setCentralWidget(self.login_window)
         self.cur_widget = self.login_window
-        self.restore_window_state((470, 570))
+        self.restore_window_state((570, 700))
 
     def show_register_window(self):
         from authorization.register_window import RegisterWindow
@@ -153,11 +153,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.save_window_state()
         if self.user_token and self.user_id:
-            make_server_request_async('logout_current', {
-                'user_token': self.user_token,
+            from network.transport import SyncHTTPRequest
+            SyncHTTPRequest.post('logout_current', {
+                'session_token': self.session_token,
                 'user_id': self.user_id,
-                'session_token': self.session_token
-            }, lambda x: None)
+                'user_token': self.user_token
+            })
         event.accept()
 
     def _clear_cur_widget(self):

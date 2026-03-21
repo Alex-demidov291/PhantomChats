@@ -38,19 +38,4 @@ def find_file(relative_path):
         if os.path.exists(path):
             return path
 
-    debug_path = os.path.join(os.path.dirname(sys.executable), 'path_debug.txt')
-    with open(debug_path, 'w', encoding='utf-8') as f:
-        f.write(f"Искали файл: {relative_path}\n")
-        f.write(f"BASE_PATH: {BASE_PATH}\n")
-        f.write(f"sys.executable: {sys.executable}\n\n")
-        f.write("Проверяли пути:\n")
-        for p in candidates:
-            f.write(f"  {'OK' if os.path.exists(p) else 'НЕТ'}: {p}\n")
-        f.write("\nСодержимое BASE_PATH:\n")
-        try:
-            for item in os.listdir(BASE_PATH):
-                f.write(f"  {item}\n")
-        except Exception as e:
-            f.write(f"  Ошибка: {e}\n")
-
     return None

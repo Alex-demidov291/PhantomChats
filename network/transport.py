@@ -33,7 +33,6 @@ class SSEListener(QObject):
         request.setAttribute(QNetworkRequest.Attribute.CacheLoadControlAttribute,
                              QNetworkRequest.CacheLoadControl.AlwaysNetwork)
         self.reply = self.nam.get(request)
-        self.reply.sslErrors.connect(self.reply.ignoreSslErrors)
         self.reply.readyRead.connect(self._on_ready_read)
         self.reply.finished.connect(self._on_finished)
         self.connection_status.emit(True)
@@ -76,8 +75,59 @@ class SSEListener(QObject):
             QTimer.singleShot(1000, self.start)
 
 
+class AsyncHTTPRequest(QObject):
+    _active_requests = []
+    def __init__(self, endpoint, data, callback):
+        super().__init__()
+        self._callback = callback
+        AsyncHTTPRequest._active_requests.append(self)
+
+        url = QUrl(f"{SERVER_URL}/api/{endpoint}")
+        request = QNetworkRequest(url)
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        request.setAttribute(
+            QNetworkRequest.Attribute.CacheLoadControlAttribute,
+            QNetworkRequest.CacheLoadControl.AlwaysNetwork
+        )
+        from network.api import messenger_api
+        if messenger_api and messenger_api.device_id:
+            request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
+        if 'session_token' in data:
+            request.setRawHeader(b"X-Session-Token", str(data.pop('session_token')).encode())
+        if 'user_id' in data:
+            request.setRawHeader(b"X-User-Id", str(data.pop('user_id')).encode())
+        if 'user_token' in data:
+            request.setRawHeader(b"X-User-Token", str(data.pop('user_token')).encode())
+
+        body = QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+        self._nam = QNetworkAccessManager()
+        self._reply = self._nam.post(request, body)
+        self._reply.finished.connect(self._on_finished)
+
+    def _on_finished(self):
+        result = None
+        try:
+            if self._reply.error() != QNetworkReply.NetworkError.NoError:
+                result = {'success': False, 'error': self._reply.errorString()}
+            else:
+                status = self._reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                raw = self._reply.readAll().data()
+                result = json.loads(raw)
+                if status and status != 200:
+                    result = {'success': False, 'error': result.get('error', f'HTTP {status}')}
+        except Exception as e:
+            result = {'success': False, 'error': str(e)}
+        finally:
+            self._reply.deleteLater()
+            if self in AsyncHTTPRequest._active_requests:
+                AsyncHTTPRequest._active_requests.remove(self)
+
+        self._callback(result)
+
+
 class SyncHTTPRequest:
-    # -- синхронный https запрос
+    # -- синхронный https запрос для е2ее
     @staticmethod
     def post(endpoint, data=None):
         url = QUrl(f"{SERVER_URL}/api/{endpoint}")
@@ -99,7 +149,6 @@ class SyncHTTPRequest:
         json_data = QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8')) if data else QByteArray()
         nam = QNetworkAccessManager()
         reply = nam.post(request, json_data)
-        reply.sslErrors.connect(reply.ignoreSslErrors)
         loop = QEventLoop()
         reply.finished.connect(loop.quit)
         loop.exec()

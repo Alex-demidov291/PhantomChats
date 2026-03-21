@@ -19,6 +19,7 @@ from PyQt6.QtCore import QByteArray, QBuffer
 
 from utils import BASE_PATH
 from network import make_server_request_async, messenger_api, Contact
+from network.crypto import KeyChangedError
 import markdown
 import base64
 import html
@@ -26,120 +27,130 @@ import bleach
 
 
 class Bridge(QObject):
-    # -- мост для связи с html
     def __init__(self, chat_window):
         super().__init__()
         self.chat_window = chat_window
 
     @pyqtSlot()
     def loadUserData(self):
-        # - загрузка данных юзера
         self.chat_window.load_user_data()
 
     @pyqtSlot(str)
     def loadMessages(self, contact_login):
-        # - загрузка сообщения
         self.chat_window.load_messages(contact_login)
 
     @pyqtSlot(str, str)
     def sendMessage(self, receiver_login, text):
-        # - отправка сообщение
         self.chat_window.send_message(receiver_login, text)
 
     @pyqtSlot(str)
     def attachFile(self, params_json):
-        # - прикрепление файла
         self.chat_window.attach_file(params_json)
 
     @pyqtSlot(int, str)
     def downloadFile(self, file_id, file_info_json):
-        file_info = json.loads(file_info_json)
-        self.chat_window.download_file(file_id, file_info)
+        self.chat_window.download_file(file_id, json.loads(file_info_json))
 
     @pyqtSlot(str)
     def addContact(self, login):
-        # - добавление контакта
         self.chat_window.add_contact(login)
 
     @pyqtSlot(str)
     def deleteChat(self, contact_login):
-        # - удаление чата
         self.chat_window.delete_chat(contact_login)
 
     @pyqtSlot(str, str)
     def renameContact(self, contact_login, new_name):
-        # - переименование контакта
         self.chat_window.rename_contact(contact_login, new_name)
 
     @pyqtSlot()
     def showSettings(self):
-        # - показ настроек
         self.chat_window.show_settings()
 
     @pyqtSlot(str, str)
     def saveFullscreenImage(self, image_data, file_name):
-        # - сохрание картинки
         self.chat_window.save_fullscreen_image(image_data, file_name)
 
 
 class MessageCache:
-    #  -- кэш сообщений
     def __init__(self, user_id):
         self.user_id = user_id
         from utils import DATA_PATH
         self.cache_dir = DATA_PATH / 'chats_save' / str(user_id)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_contact_file(self, contact_login):
-        return self.cache_dir / f"{contact_login}.json"
+    def _get_contact_file(self, contact_user_id):
+        return self.cache_dir / f"{contact_user_id}.json"
 
-    def load_messages(self, contact_login):
-        filepath = self._get_contact_file(contact_login)
-        if not filepath.exists():
+    def load_messages(self, contact_user_id):
+        fayl = self._get_contact_file(contact_user_id)
+        if not fayl.exists():
             return []
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data.get('messages', [])
+        try:
+            with open(fayl, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('messages', [])
+        except (json.JSONDecodeError, OSError):
+            return []
 
-    def save_messages(self, contact_login, messages):
-        filepath = self._get_contact_file(contact_login)
+    def save_messages(self, contact_user_id, messages):
+        fayl = self._get_contact_file(contact_user_id)
         data = {
-            'contact_login': contact_login,
+            'contact_user_id': contact_user_id,
             'messages': messages,
             'last_message_id': messages[-1]['id'] if messages else 0,
             'updated_at': time.time()
         }
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(fayl, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def append_messages(self, contact_login, new_messages):
-        if not new_messages:
+    def append_messages(self, contact_user_id, novye):
+        if not novye:
             return []
-        current = self.load_messages(contact_login)
-        existing_ids = {msg['id'] for msg in current}
-        to_add = [msg for msg in new_messages if msg['id'] not in existing_ids]
-        if not to_add:
+        tekushchie = self.load_messages(contact_user_id)
+        est_ids = {msg['id'] for msg in tekushchie}
+        dobavit = [msg for msg in novye if msg['id'] not in est_ids]
+        if not dobavit:
             return []
-        current.extend(to_add)
-        current.sort(key=lambda x: x['id'])
-        self.save_messages(contact_login, current)
-        return to_add
+        tekushchie.extend(dobavit)
+        tekushchie.sort(key=lambda x: x['id'])
+        self.save_messages(contact_user_id, tekushchie)
+        return dobavit
 
-    def get_last_message_id(self, contact_login):
-        filepath = self._get_contact_file(contact_login)
-        if not filepath.exists():
+    def get_last_message_id(self, contact_user_id):
+        fayl = self._get_contact_file(contact_user_id)
+        if not fayl.exists():
             return 0
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data.get('last_message_id', 0)
+        try:
+            with open(fayl, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('last_message_id', 0)
+        except (json.JSONDecodeError, OSError):
+            return 0
 
     def clear_cache(self):
         shutil.rmtree(self.cache_dir, ignore_errors=True)
 
+    def save_contact_settings_cache(self, nastroyki):
+        fayl = self.cache_dir / "contact_settings.json"
+        try:
+            with open(fayl, 'w', encoding='utf-8') as f:
+                json.dump(nastroyki, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def load_contact_settings_cache(self):
+        fayl = self.cache_dir / "contact_settings.json"
+        if fayl.exists():
+            try:
+                with open(fayl, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
+
 
 class ChatWindow(QWidget):
-    # -- главное окно чата
-
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
@@ -149,16 +160,18 @@ class ChatWindow(QWidget):
         self.script_dir = Path(BASE_PATH)
         self.page_loaded = False
         self.e2ee_ready = False
+        self.pending_contact_load = None
+        self.settings_retry_count = 0
 
         self.avatar_timer = QTimer()
         self.avatar_timer.timeout.connect(self.check_avatar_updates)
         self.avatar_timer.setInterval(60000)
 
         self.msg_cache = MessageCache(main_window.user_id)
-
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self.sync_all_contacts)
         self.sync_timer.setInterval(60000)
+        self.contacts_need_update = False
 
         self.init_ui()
         self.load_contacts()
@@ -197,22 +210,20 @@ class ChatWindow(QWidget):
             self.web_view.setUrl(QUrl.fromLocalFile(str(html_path.absolute())))
         else:
             self.web_view.setHtml("""
-                <!DOCTYPE html>
-                <html>
+                <!DOCTYPE html><html>
                 <head><meta charset="UTF-8"><title>Ошибка</title></head>
                 <body style="font-family: Arial; padding: 20px;">
                     <h2>Файл messages.html не найден</h2>
-                </body>
-                </html>
+                </body></html>
             """)
-
         layout.addWidget(self.web_view)
 
     def on_page_loaded(self, ok):
         if ok:
             self.page_loaded = True
             self.load_user_data()
-            self._update_contacts_js()
+            if self.contacts_need_update:
+                self._update_contacts_js()
             if self.cur_contact:
                 self.load_messages(self.cur_contact.login)
             self.sync_all_contacts()
@@ -225,81 +236,197 @@ class ChatWindow(QWidget):
     def fetch_contact_pubkey(self, contact):
         if not messenger_api.e2ee_contact_manager:
             return
-        pub = messenger_api.e2ee_contact_manager.get_contact_public_key(contact.login)
-        if pub:
-            contact.public_key = pub
+        kluch = messenger_api.e2ee_contact_manager.get_contact_public_key(contact.login)
+        if kluch:
+            contact.public_key = kluch
+
+    def _prefetch_key_then(self, contact, callback):
+        if not messenger_api.e2ee_contact_manager:
+            callback()
+            return
+
+        if contact.login in messenger_api.e2ee_contact_manager.contact_keys:
+            contact.public_key = messenger_api.e2ee_contact_manager.contact_keys[contact.login]
+            callback()
+            return
+
+        def handle_key_otvet(otvet):
+            if otvet and otvet.get('success'):
+                try:
+                    kluch = messenger_api.e2ee_contact_manager.process_key_response(contact.login, otvet)
+                    if kluch:
+                        contact.public_key = kluch
+                except KeyChangedError as e:
+                    contact.public_key = e.new_key_bytes
+                    safe_login = html.escape(contact.login).replace('"', '\\"')
+                    self.web_view.page().runJavaScript(
+                        f'showToast("⚠ Ключ {safe_login} изменился. Проверьте безопасность.", true);'
+                    )
+            callback()
+
+        make_server_request_async('get_public_key', {
+            'contact_login': contact.login,
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id,
+            'session_token': self.main_window.session_token
+        }, handle_key_otvet)
 
     def _process_e2ee_msg(self, msg, contact_login):
         if 'decrypted_text' in msg:
             return
-        text = msg.get('message_text', '')
-        if not text:
+
+        tekst = msg.get('message_text', '')
+        if not tekst or not isinstance(tekst, str):
             return
-        if isinstance(text, str):
-            data = json.loads(text)
-        else:
-            data = text
-        if isinstance(data, dict) and data.get('type') == 'e2ee':
-            if messenger_api.e2ee_message_handler:
-                decrypted = messenger_api.e2ee_message_handler.decrypt_message(
-                    data['data'],
-                    contact_login
-                )
-                msg['message_text'] = decrypted
-            else:
-                msg['message_text'] = '[Ошибка: E2EE не инициализирован]'
+        if not tekst.strip().startswith('{'):
+            return
+
+        data = json.loads(tekst)
+        if not isinstance(data, dict) or data.get('type') != 'e2ee':
+            return
+
+        if not messenger_api.e2ee_message_handler:
+            msg['message_text'] = '[E2EE не инициализирован]'
+            return
+
+        try:
+            msg['message_text'] = messenger_api.e2ee_message_handler.decrypt_message(
+                data['data'], contact_login)
+        except Exception:
+            msg['message_text'] = '[Ошибка расшифровки]'
+
+    def _decrypt_file_bytes(self, raw_bytes, file_info, sender_login=None):
+        if not file_info or not file_info.get('is_encrypted'):
+            return raw_bytes
+        encrypted_key = file_info.get('encrypted_key')
+        nonce_file = file_info.get('nonce_file')
+        if not encrypted_key or not nonce_file or not messenger_api.e2ee_master_key:
+            return None
+        try:
+            nonce_bytes = base64.b64decode(nonce_file)
+            return messenger_api.decrypt_file_data(raw_bytes, nonce_bytes, encrypted_key,
+                                                   sender_login=sender_login)
+        except Exception:
+            return None
+
+    def _ensure_sender_key_cached(self, sender_login):
+        if not sender_login or not messenger_api.e2ee_contact_manager:
+            return
+        if sender_login in messenger_api.e2ee_contact_manager.contact_keys:
+            return
+        if sender_login == self.main_window.current_user:
+            return
+        kontakt = self.contacts.get(sender_login)
+        if kontakt and kontakt.public_key:
+            messenger_api.e2ee_contact_manager.contact_keys[sender_login] = kontakt.public_key
 
     def load_messages(self, contact_login):
+        self.pending_contact_load = contact_login
         if not self.page_loaded:
             return
-        contact = self.contacts.get(contact_login)
-        if not contact:
+        kontakt = self.contacts.get(contact_login)
+        if not kontakt:
+            make_server_request_async('get_user_info', {
+                'user_token': self.main_window.user_token,
+                'user_id': self.main_window.user_id,
+                'target_login': contact_login,
+                'session_token': self.main_window.session_token
+            }, lambda otvet: self._handle_user_info_response(contact_login, otvet))
+            return
+        self._load_messages_after_contact(kontakt)
+
+    def _handle_user_info_response(self, contact_login, otvet):
+        if self.pending_contact_load != contact_login:
+            return
+        if otvet and otvet.get('success'):
+            u = otvet.get('user')
+            novyy = Contact(login=u['login'], username=u['username'],
+                            user_id=u['user_id'], avatar_version=u.get('avatar_version', 0))
+            sushchestvuyushchiy = next(
+                (c for c in self.contacts.values() if c.user_id == novyy.user_id), None)
+            kontakt = sushchestvuyushchiy if sushchestvuyushchiy else novyy
+            if not sushchestvuyushchiy:
+                self.contacts[contact_login] = kontakt
+            self.load_contact_avatar(kontakt)
+            if messenger_api.e2ee_contact_manager:
+                self.fetch_contact_pubkey(kontakt)
+            self._load_messages_after_contact(kontakt)
+        else:
+            oshibka = otvet.get('error', 'Контакт не найден') if otvet else 'Ошибка соединения'
+            self.web_view.page().runJavaScript(f'showToast("{oshibka}", true);')
+
+    def _load_messages_after_contact(self, contact):
+        if self.pending_contact_load != contact.login:
             return
         self.cur_contact = contact
+        if messenger_api.e2ee_contact_manager:
+            self._prefetch_key_then(contact, lambda: self._render_messages(contact))
+        else:
+            self._render_messages(contact)
 
-        if messenger_api.e2ee_contact_manager and not contact.public_key:
-            self.fetch_contact_pubkey(contact)
+    def _render_messages(self, contact):
+        if self.pending_contact_load != contact.login:
+            return
 
-        messages = self.msg_cache.load_messages(contact_login)
-        processed = []
-        for msg in messages:
-            if msg['sender_login'] == self.main_window.current_user:
-                login_for_decrypt = msg['receiver_login']
-            else:
-                login_for_decrypt = msg['sender_login']
-            self._process_e2ee_msg(msg, login_for_decrypt)
-            processed.append(self.prepare_msg_for_display(msg))
+        aktualnyy = self.contacts.get(contact.login, contact)
+        self.cur_contact = aktualnyy
 
-        self.web_view.page().runJavaScript(f'setMessages({json.dumps(processed)});')
-        self.ensure_msg_previews(contact_login, messages)
-        self.sync_contact_msgs(contact_login)
+        soobshenia = self.msg_cache.load_messages(aktualnyy.user_id)
+        obrabotannyye = []
+        for msg in soobshenia:
+            msg = dict(msg)
+            login_dlya_decrypt = (msg['receiver_login']
+                                  if msg['sender_login'] == self.main_window.current_user
+                                  else msg['sender_login'])
+            self._process_e2ee_msg(msg, login_dlya_decrypt)
+            obrabotannyye.append(self.prepare_msg_for_display(msg))
+
+        self.web_view.page().runJavaScript(f'setMessages({json.dumps(obrabotannyye)});')
+        self.ensure_msg_previews(aktualnyy.user_id, soobshenia)
+        self.sync_contact_msgs(aktualnyy)
 
     def send_message(self, receiver_login, text):
         if not receiver_login or not text:
             return
 
-        def handle_send_response(response):
-            if response and response.get('success'):
-                sent_message = response.get('message')
-                if sent_message:
-                    sent_message['decrypted_text'] = text
-                    self.msg_cache.append_messages(receiver_login, [sent_message])
-                    msg_display = self.prepare_msg_for_display(sent_message)
-                    self.web_view.page().runJavaScript(f'appendMessage({json.dumps(msg_display)});')
-                    self.web_view.page().runJavaScript('document.getElementById("messageInput").value = "";')
+        def handle_send_otvet(otvet):
+            if otvet and otvet.get('success'):
+                otpravlennoe = otvet.get('message')
+                if otpravlennoe:
+                    otpravlennoe['decrypted_text'] = text
+                    kontakt = self.contacts.get(receiver_login)
+                    if kontakt:
+                        self.msg_cache.append_messages(kontakt.user_id, [otpravlennoe])
+                    self.web_view.page().runJavaScript(
+                        f'appendMessage({json.dumps(self.prepare_msg_for_display(otpravlennoe))});')
+                    self.web_view.page().runJavaScript(
+                        'document.getElementById("messageInput").value = "";')
+                    if kontakt:
+                        self.ensure_msg_previews(kontakt.user_id, [otpravlennoe])
             else:
-                error = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
-                safe_error = html.escape(error).replace('"', '\\"').replace("'", "\\'")
+                oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+                safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
-        response = messenger_api.send_message(
-            token=self.main_window.user_token,
-            user_id=self.main_window.user_id,
-            receiver_login=receiver_login,
-            text=text,
-            file_id=None
-        )
-        handle_send_response(response)
+        try:
+            handle_send_otvet(messenger_api.send_message(
+                token=self.main_window.user_token,
+                user_id=self.main_window.user_id,
+                receiver_login=receiver_login,
+                text=text,
+                file_id=None
+            ))
+        except KeyChangedError:
+            safe_login = html.escape(receiver_login).replace('"', '\\"')
+            self.web_view.page().runJavaScript(
+                f'showToast("Ключ {safe_login} изменился. Проверьте безопасность.", true);')
+            handle_send_otvet(messenger_api.send_message(
+                token=self.main_window.user_token,
+                user_id=self.main_window.user_id,
+                receiver_login=receiver_login,
+                text=text,
+                file_id=None
+            ))
 
     def attach_file(self, params_json):
         if not self.cur_contact:
@@ -307,106 +434,121 @@ class ChatWindow(QWidget):
             return
 
         params = json.loads(params_json)
-        text_from_input = params.get('text', '')
-        is_image_only = params.get('isImageOnly', False)
+        tekst_vvoda = params.get('text', '')
+        tolko_kartinka = params.get('isImageOnly', False)
 
-        file_filter = "Все файлы (*)"
-        if is_image_only:
-            file_filter = "Изображения (*.jpg *.jpeg *.png *.gif *.bmp)"
+        if tolko_kartinka:
+            filtr = "Изображения (*.jpg *.jpeg *.png *.gif *.bmp)"
         else:
-            file_filter = ("Все файлы (*);;Изображения (*.jpg *.jpeg *.png *.gif *.bmp *.webp);;"
-                           "Документы (*.pdf *.doc *.docx *.txt *.xls *.xlsx *.ppt *.pptx)")
+            filtr = ("Все файлы (*);;Изображения (*.jpg *.jpeg *.png *.gif *.bmp *.webp);;"
+                     "Документы (*.pdf *.doc *.docx *.txt *.xls *.xlsx *.ppt *.pptx)")
 
-        file_path, _ = QFileDialog.getOpenFileName(self, "Выбрать файл", "", file_filter)
-        if not file_path:
+        put_fayla, _ = QFileDialog.getOpenFileName(self, "Выбрать файл", "", filtr)
+        if not put_fayla:
             return
 
-        file_size = os.path.getsize(file_path)
-        if file_size > 10 * 1024 * 1024:
+        if os.path.getsize(put_fayla) > 10 * 1024 * 1024:
             self.web_view.page().runJavaScript('showToast("Файл слишком большой (максимум 10MB)", true);')
             return
 
-        file_name = os.path.basename(file_path)
-        file_type, _ = mimetypes.guess_type(file_path)
-        if not file_type:
-            file_type = "application/octet-stream"
+        imya_fayla = os.path.basename(put_fayla)
+        tip_fayla, _ = mimetypes.guess_type(put_fayla)
+        if not tip_fayla:
+            tip_fayla = "application/octet-stream"
 
         self.web_view.page().runJavaScript('showProgress(0);')
+        with open(put_fayla, 'rb') as f:
+            dannyye = f.read()
 
-        with open(file_path, 'rb') as f:
-            file_data = f.read()
-        file_base64 = base64.b64encode(file_data).decode('utf-8')
-
-        def handle_upload_response(response):
+        def handle_upload_otvet(otvet):
             self.web_view.page().runJavaScript('showProgress(100);')
-            if response and response.get('success'):
-                file_id = response.get('file_id')
-                self._send_msg_with_file(file_id, text_from_input, file_name, file_type, is_image_only)
+            if otvet and otvet.get('success'):
+                self._send_msg_with_file(otvet.get('file_id'), tekst_vvoda,
+                                         imya_fayla, tip_fayla, tolko_kartinka)
             else:
-                error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
-                safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
+                oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+                safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
-        make_server_request_async('upload_file', {
+        payload = {
             'user_token': self.main_window.user_token,
             'user_id': self.main_window.user_id,
-            'file_data': file_base64,
-            'file_name': file_name,
-            'file_type': file_type,
-            'is_image_only': is_image_only,
+            'file_name': imya_fayla,
+            'file_type': tip_fayla,
+            'is_image_only': tolko_kartinka,
             'session_token': self.main_window.session_token
-        }, handle_upload_response)
+        }
+
+        login_poluchatelya = self.cur_contact.login
+        pub_poluchatelya = (messenger_api.e2ee_contact_manager.contact_keys.get(login_poluchatelya)
+                            if messenger_api.e2ee_master_key and messenger_api.e2ee_contact_manager
+                            else None)
+
+        if pub_poluchatelya:
+            enc = messenger_api.encrypt_file_data(dannyye, None, receiver_login=login_poluchatelya)
+            payload['file_data'] = enc['ciphertext']
+            payload['encrypted_key'] = enc['encrypted_key']
+            payload['nonce_file'] = enc['nonce_file']
+            payload['is_encrypted'] = 1
+        else:
+            payload['file_data'] = base64.b64encode(dannyye).decode('utf-8')
+
+        make_server_request_async('upload_file', payload, handle_upload_otvet)
 
     def _send_msg_with_file(self, file_id, text, file_name, file_type, is_image_only):
-        full_text = text if text.strip() else ""
+        polnyy_tekst = text if text.strip() else ""
 
-        def handle_send_response(response):
-            if response and response.get('success'):
-                sent_message = response.get('message')
-                if sent_message:
-                    sent_message['decrypted_text'] = full_text
-                    self.msg_cache.append_messages(self.cur_contact.login, [sent_message])
-                    msg_display = self.prepare_msg_for_display(sent_message)
-                    self.web_view.page().runJavaScript(f'appendMessage({json.dumps(msg_display)});')
-                    self.web_view.page().runJavaScript('document.getElementById("messageInput").value = "";')
-                    self.ensure_msg_previews(self.cur_contact.login, [sent_message])
+        def handle_send_otvet(otvet):
+            if otvet and otvet.get('success'):
+                otpravlennoe = otvet.get('message')
+                if otpravlennoe:
+                    otpravlennoe['decrypted_text'] = polnyy_tekst
+                    self.msg_cache.append_messages(self.cur_contact.user_id, [otpravlennoe])
+                    self.web_view.page().runJavaScript(
+                        f'appendMessage({json.dumps(self.prepare_msg_for_display(otpravlennoe))});')
+                    self.web_view.page().runJavaScript(
+                        'document.getElementById("messageInput").value = "";')
+                    self.ensure_msg_previews(self.cur_contact.user_id, [otpravlennoe])
             else:
-                error = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
-                safe_error = html.escape(error).replace('"', '\\"').replace("'", "\\'")
+                oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+                safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
-        response = messenger_api.send_message(
+        handle_send_otvet(messenger_api.send_message(
             token=self.main_window.user_token,
             user_id=self.main_window.user_id,
             receiver_login=self.cur_contact.login,
-            text=full_text,
+            text=polnyy_tekst,
             file_id=file_id
-        )
-        handle_send_response(response)
+        ))
 
     def download_file(self, file_id, file_info):
         if messenger_api.file_cache and messenger_api.file_cache.has_file(file_id):
-            file_data = messenger_api.file_cache.get_file_data(file_id)
-            if file_data:
-                self.save_file_dialog(file_info['name'], file_data)
+            dannyye = messenger_api.file_cache.get_file_data(file_id)
+            if dannyye:
+                self.save_file_dialog(file_info['name'], dannyye)
                 return
 
         self.web_view.page().runJavaScript('showProgress(0);')
 
-        def handle_file_response(response):
+        def handle_file_otvet(otvet):
             self.web_view.page().runJavaScript('showProgress(100);')
-            if response and response.get('success'):
-                file_data = base64.b64decode(response.get('file_data'))
-                self.save_file_dialog(file_info['name'], file_data)
+            if otvet and otvet.get('success'):
+                raw = base64.b64decode(otvet.get('file_data'))
+                dannyye = self._decrypt_file_bytes(raw, file_info,
+                                                   sender_login=file_info.get('sender_login'))
+                if dannyye is None:
+                    self.web_view.page().runJavaScript('showToast("Ошибка расшифровки файла", true);')
+                    return
+                self.save_file_dialog(file_info['name'], dannyye)
                 if messenger_api.file_cache:
                     messenger_api.file_cache.save_file(
-                        file_id, file_info['name'], file_info['type'],
-                        len(file_data), file_data, None
-                    )
+                        file_id, file_info['name'], file_info['type'], len(dannyye), dannyye, None)
             else:
-                error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
-                safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Не удалось загрузить файл: {safe_error}", true);')
+                oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+                safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
+                self.web_view.page().runJavaScript(
+                    f'showToast("Не удалось загрузить файл: {safe_error}", true);')
 
         make_server_request_async('get_file', {
             'user_token': self.main_window.user_token,
@@ -415,76 +557,42 @@ class ChatWindow(QWidget):
             'include_data': True,
             'include_thumbnail': True,
             'session_token': self.main_window.session_token
-        }, handle_file_response)
+        }, handle_file_otvet)
 
-    def save_file_dialog(self, file_name, file_data):
+    def save_file_dialog(self, file_name, dannyye):
         from PyQt6.QtCore import QCoreApplication
-        main_window = self.main_window
-        main_window.activateWindow()
-        main_window.raise_()
+        self.main_window.activateWindow()
+        self.main_window.raise_()
         QCoreApplication.processEvents()
 
         suffix = Path(file_name).suffix.lstrip('.')
-        if suffix:
-            filter_str = f"{suffix.upper()} файлы (*.{suffix});;Все файлы (*)"
-        else:
-            filter_str = "Все файлы (*)"
+        filtr = (f"{suffix.upper()} файлы (*.{suffix});;Все файлы (*)"
+                 if suffix else "Все файлы (*)")
 
-        save_path, _ = QFileDialog.getSaveFileName(main_window, "Сохранить файл", file_name, filter_str)
-
-        if save_path:
-            with open(save_path, 'wb') as f:
-                f.write(file_data)
+        put_sohraneniya, _ = QFileDialog.getSaveFileName(
+            self.main_window, "Сохранить файл", file_name, filtr)
+        if put_sohraneniya:
+            with open(put_sohraneniya, 'wb') as f:
+                f.write(dannyye)
             self.web_view.page().runJavaScript('showToast("Файл сохранен");')
         else:
             self.web_view.page().runJavaScript('showToast("Сохранение отменено");')
 
     def save_fullscreen_image(self, image_data, file_name):
-        import re
-        if image_data.startswith('data:image'):
-            image_data = re.sub('^data:image/.+;base64,', '', image_data)
-        file_bytes = base64.b64decode(image_data)
-        self.save_file_dialog(file_name, file_bytes)
-
-    def _handle_add_contact_search(self, contact_login, response):
-        if response and response.get('success'):
-            users = response.get('users', [])
-            username = contact_login
-            user_id = None
-            avatar_version = 0
-            for user in users:
-                if user['login'] == contact_login:
-                    username = user['username']
-                    user_id = user['user_id']
-                    avatar_version = user.get('avatar_version', 0)
-                    break
-
-            new_contact = Contact(
-                login=contact_login,
-                username=username,
-                user_id=user_id,
-                avatar_version=avatar_version
-            )
-            new_contact.update_avatar_check_time()
-            self.contacts[contact_login] = new_contact
-            self.load_contact_avatar(new_contact)
-            if messenger_api.e2ee_contact_manager:
-                self.fetch_contact_pubkey(new_contact)
-            self._update_contacts_js()
-            self.web_view.page().runJavaScript('showToast("Контакт добавлен!");')
-
-    def _handle_add_contact_response(self, contact_login, response):
-        if response and response.get('success'):
-            make_server_request_async('search_users', {
-                'user_token': self.main_window.user_token,
-                'user_id': self.main_window.user_id,
-                'search_query': contact_login,
-                'session_token': self.main_window.session_token
-            }, lambda resp: self._handle_add_contact_search(contact_login, resp))
-        else:
-            error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
-            safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-            self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+        from PyQt6.QtCore import QCoreApplication
+        if image_data.startswith('data:'):
+            image_data = image_data.split(',', 1)[1]
+        bayty = base64.b64decode(image_data)
+        self.main_window.activateWindow()
+        self.main_window.raise_()
+        QCoreApplication.processEvents()
+        put_sohraneniya, _ = QFileDialog.getSaveFileName(
+            self.main_window, "Сохранить изображение", file_name,
+            "Изображения (*.jpg *.png *.gif);;Все файлы (*)")
+        if put_sohraneniya:
+            with open(put_sohraneniya, 'wb') as f:
+                f.write(bayty)
+            self.web_view.page().runJavaScript('showToast("Изображение сохранено");')
 
     def add_contact(self, contact_login):
         if not contact_login:
@@ -494,27 +602,43 @@ class ChatWindow(QWidget):
             self.web_view.page().runJavaScript('showToast("Нельзя добавить самого себя!", true);')
             return
         if contact_login in self.contacts:
-            self.web_view.page().runJavaScript('showToast("Этот контакт уже добавлен!", true);')
+            self.web_view.page().runJavaScript('showToast("Этот пользователь уже в контактах!", true);')
             return
-
         make_server_request_async('add_contact', {
             'user_token': self.main_window.user_token,
             'user_id': self.main_window.user_id,
             'contact_login': contact_login,
             'session_token': self.main_window.session_token
-        }, lambda resp: self._handle_add_contact_response(contact_login, resp))
+        }, lambda otvet: self._handle_add_contact_response(contact_login, otvet))
 
-    def _handle_remove_contact_response(self, contact_login, response):
-        if response and response.get('success'):
-            if contact_login in self.contacts:
-                del self.contacts[contact_login]
-            if contact_login in self.contact_avatars:
-                del self.contact_avatars[contact_login]
-            self._update_contacts_js()
-            if self.cur_contact and self.cur_contact.login == contact_login:
-                self.cur_contact = None
-                self.web_view.page().runJavaScript('showWelcomeScreen();')
-            self.web_view.page().runJavaScript('showToast("Чат удален!");')
+    def _handle_add_contact_response(self, contact_login, otvet):
+        if otvet and otvet.get('success'):
+            make_server_request_async('get_user_info', {
+                'user_token': self.main_window.user_token,
+                'user_id': self.main_window.user_id,
+                'target_login': contact_login,
+                'session_token': self.main_window.session_token
+            }, lambda resp: self._handle_add_contact_info(contact_login, resp))
+        else:
+            oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+            safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
+            self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+
+    def _handle_add_contact_info(self, contact_login, otvet):
+        if otvet and otvet.get('success'):
+            u = otvet.get('user')
+            if u:
+                novyy = Contact(login=u['login'], username=u['username'],
+                                user_id=u['user_id'], avatar_version=u.get('avatar_version', 0))
+                self.contacts[contact_login] = novyy
+                self.load_contact_avatar(novyy)
+                if messenger_api.e2ee_contact_manager:
+                    self.fetch_contact_pubkey(novyy)
+                self._update_contacts_js()
+                self.web_view.page().runJavaScript('showToast("Контакт добавлен!");')
+                self.load_contact_settings()
+        else:
+            self.web_view.page().runJavaScript('showToast("Пользователь не найден!", true);')
 
     def delete_chat(self, contact_login):
         make_server_request_async('remove_contact', {
@@ -522,33 +646,43 @@ class ChatWindow(QWidget):
             'user_id': self.main_window.user_id,
             'contact_login': contact_login,
             'session_token': self.main_window.session_token
-        }, lambda resp: self._handle_remove_contact_response(contact_login, resp))
+        }, lambda otvet: self._handle_remove_contact_response(contact_login, otvet))
 
-    def _handle_rename_contact_response(self, contact_login, new_name, response):
-        if response and response.get('success'):
-            if contact_login in self.contacts:
-                self.contacts[contact_login].display_name = new_name
-                self._update_contacts_js()
-
-                if self.cur_contact and self.cur_contact.login == contact_login:
-                    self.cur_contact.display_name = new_name
-                    safe_name = html.escape(new_name).replace('"', '\\"').replace("'", "\\'")
-                    self.web_view.page().runJavaScript(
-                        f'document.getElementById("chatName").textContent = "{safe_name}";')
-
-                self.web_view.page().runJavaScript('showToast("Контакт переименован!");')
+    def _handle_remove_contact_response(self, contact_login, otvet):
+        if otvet and otvet.get('success'):
+            self.contacts.pop(contact_login, None)
+            self.contact_avatars.pop(contact_login, None)
+            self._update_contacts_js()
+            if self.cur_contact and self.cur_contact.login == contact_login:
+                self.cur_contact = None
+                self.web_view.page().runJavaScript('showWelcomeScreen();')
+            self.web_view.page().runJavaScript('showToast("Чат удален!");')
 
     def rename_contact(self, contact_login, new_name):
         if not new_name:
             return
-
+        if len(new_name) > 64:
+            self.web_view.page().runJavaScript('showToast("Имя не может быть длиннее 64 символов", true);')
+            return
         make_server_request_async('save_contact_settings', {
             'user_token': self.main_window.user_token,
             'user_id': self.main_window.user_id,
             'contact_login': contact_login,
             'display_name': new_name,
             'session_token': self.main_window.session_token
-        }, lambda resp: self._handle_rename_contact_response(contact_login, new_name, resp))
+        }, lambda otvet: self._handle_rename_contact_response(contact_login, new_name, otvet))
+
+    def _handle_rename_contact_response(self, contact_login, new_name, otvet):
+        if otvet and otvet.get('success') and contact_login in self.contacts:
+            self.contacts[contact_login].display_name = new_name
+            self._update_contacts_js()
+            self._save_settings_cache()
+            if self.cur_contact and self.cur_contact.login == contact_login:
+                self.cur_contact.display_name = new_name
+                safe_name = html.escape(new_name).replace('"', '\\"').replace("'", "\\'")
+                self.web_view.page().runJavaScript(
+                    f'document.getElementById("chatName").textContent = "{safe_name}";')
+            self.web_view.page().runJavaScript('showToast("Контакт переименован!");')
 
     def show_settings(self):
         self.main_window.show_settings_window()
@@ -558,72 +692,85 @@ class ChatWindow(QWidget):
         messenger_api.network_manager.avatar_updated.connect(self.on_avatar_updated)
 
     def on_msg_received(self, message_data):
-        if message_data['sender_login'] == self.main_window.current_user:
-            contact_login = message_data['receiver_login']
-        else:
-            contact_login = message_data['sender_login']
+        login_kontakta = (message_data['receiver_login']
+                          if message_data['sender_login'] == self.main_window.current_user
+                          else message_data['sender_login'])
+        kontakt = self.contacts.get(login_kontakta)
+        if not kontakt:
+            return
 
-        self._process_e2ee_msg(message_data, contact_login)
-        self.msg_cache.append_messages(contact_login, [message_data])
+        kopiya = dict(message_data)
+        self._process_e2ee_msg(kopiya, login_kontakta)
+        self.msg_cache.append_messages(kontakt.user_id, [message_data])
 
-        if self.cur_contact and self.cur_contact.login == contact_login:
-            msg_display = self.prepare_msg_for_display(message_data)
-            self.web_view.page().runJavaScript(f'appendMessage({json.dumps(msg_display)});')
-            self.ensure_msg_previews(contact_login, [message_data])
+        if self.cur_contact and self.cur_contact.user_id == kontakt.user_id:
+            self.web_view.page().runJavaScript(
+                f'appendMessage({json.dumps(self.prepare_msg_for_display(kopiya))});')
+            self.ensure_msg_previews(kontakt.user_id, [message_data])
 
     def on_avatar_updated(self, data):
-        user_id = data.get('user_id')
-        new_version = data.get('new_version')
-        for contact in self.contacts.values():
-            if contact.user_id == user_id:
-                contact.avatar_version = new_version
-                self.load_contact_avatar(contact, force_download=True)
+        for kontakt in self.contacts.values():
+            if kontakt.user_id == data.get('user_id'):
+                kontakt.avatar_version = data.get('new_version')
+                self.load_contact_avatar(kontakt, force_download=True)
                 break
 
-    def _handle_avatar_versions_response(self, need_check, response):
-        if response and response.get('success'):
-            versions = response.get('versions', {})
-            for contact in need_check:
-                server_version = versions.get(contact.user_id, 0)
-                if server_version != contact.avatar_version:
-                    contact.avatar_version = server_version
-                    self.load_contact_avatar(contact, force_download=True)
-                contact.update_avatar_check_time()
-
     def check_avatar_updates(self):
-        if not self.contacts:
+        nuzhno_proverit = [c for c in self.contacts.values() if c.needs_avatar_check()]
+        if not nuzhno_proverit:
             return
-        need_check = [c for c in self.contacts.values() if c.needs_avatar_check()]
-        if not need_check:
-            return
-
-        user_ids = [c.user_id for c in need_check]
-
         make_server_request_async('get_avatar_versions', {
             'user_token': self.main_window.user_token,
             'user_id': self.main_window.user_id,
-            'user_ids': user_ids,
+            'user_ids': [c.user_id for c in nuzhno_proverit],
             'session_token': self.main_window.session_token
-        }, lambda resp: self._handle_avatar_versions_response(need_check, resp))
+        }, lambda otvet: self._handle_avatar_versions_response(nuzhno_proverit, otvet))
 
-    def _handle_contacts_response(self, response):
-        if response and response.get('success'):
-            self.contacts = {}
-            for contact_data in response['contacts']:
-                contact = Contact(
-                    login=contact_data['login'],
-                    username=contact_data['username'],
-                    user_id=contact_data['user_id'],
-                    avatar_version=contact_data.get('avatar_version', 0)
-                )
-                contact.update_avatar_check_time()
-                self.contacts[contact_data['login']] = contact
+    def _handle_avatar_versions_response(self, nuzhno_proverit, otvet):
+        if otvet and otvet.get('success'):
+            versii = otvet.get('versions', {})
+            for kontakt in nuzhno_proverit:
+                servernaya_versiya = versii.get(kontakt.user_id, 0)
+                if servernaya_versiya != kontakt.avatar_version:
+                    kontakt.avatar_version = servernaya_versiya
+                    self.load_contact_avatar(kontakt, force_download=True)
+                kontakt.update_avatar_check_time()
 
-            self.load_contact_settings()
-            self.load_contact_avatars()
-            self.sync_all_contacts()
-            self.load_user_data()
-            self.preload_all_imgs()
+    def load_contact_avatars(self):
+        for kontakt in self.contacts.values():
+            self.load_contact_avatar(kontakt)
+
+    def load_contact_avatar(self, contact, force_download=False):
+        if (messenger_api.network_manager.has_avatar_cached(contact.user_id, contact.avatar_version)
+                and not force_download):
+            avatar_dannyye = messenger_api.network_manager.get_avatar_from_cache(
+                contact.user_id, contact.avatar_version)
+            if avatar_dannyye:
+                pixmap = QPixmap()
+                pixmap.loadFromData(avatar_dannyye)
+                self.contact_avatars[contact.login] = pixmap
+                self._update_avatar_in_js(contact.login)
+                return
+
+        def handle_avatar_otvet(otvet):
+            if otvet and otvet.get('success') and otvet.get('avatar'):
+                avatar_bayty = base64.b64decode(otvet['avatar'])
+                messenger_api.network_manager.save_avatar_to_cache(
+                    contact.user_id, contact.avatar_version, avatar_bayty)
+                if contact.avatar_version > 0:
+                    messenger_api.network_manager.remove_old_avatar(
+                        contact.user_id, contact.avatar_version - 1)
+                pixmap = QPixmap()
+                pixmap.loadFromData(avatar_bayty)
+                self.contact_avatars[contact.login] = pixmap
+                self._update_avatar_in_js(contact.login)
+
+        make_server_request_async('get_avatar', {
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id,
+            'target_user_id': contact.user_id,
+            'session_token': self.main_window.session_token
+        }, handle_avatar_otvet)
 
     def load_contacts(self):
         make_server_request_async('get_contacts', {
@@ -632,33 +779,99 @@ class ChatWindow(QWidget):
             'session_token': self.main_window.session_token
         }, self._handle_contacts_response)
 
+    def _handle_contacts_response(self, otvet):
+        if otvet and otvet.get('success'):
+            self.contacts = {}
+            for d in otvet['contacts']:
+                kontakt = Contact(login=d['login'], username=d['username'],
+                                  user_id=d['user_id'], avatar_version=d.get('avatar_version', 0))
+                kontakt.update_avatar_check_time()
+                self.contacts[d['login']] = kontakt
+            self._load_cached_settings()
+            self._update_contacts_js()
+            self.load_contact_avatars()
+            self.sync_all_contacts()
+            self.load_user_data()
+            self.preload_all_imgs()
+            QTimer.singleShot(400, self.load_contact_settings)
+
+    def sync_all_contacts(self):
+        for kontakt in self.contacts.values():
+            self.sync_contact_msgs(kontakt)
+        self.preload_all_imgs()
+
+    def sync_contact_msgs(self, contact):
+        last_id = self.msg_cache.get_last_message_id(contact.user_id)
+        make_server_request_async('get_messages_since', {
+            'user_token': self.main_window.user_token,
+            'user_id': self.main_window.user_id,
+            'contact_login': contact.login,
+            'since_id': last_id,
+            'session_token': self.main_window.session_token
+        }, lambda otvet: self._handle_messages_since_response(contact, otvet))
+
+    def _handle_messages_since_response(self, contact, otvet):
+        if not otvet or not otvet.get('success'):
+            return
+        novyye = otvet.get('messages', [])
+        if not novyye:
+            return
+        dobavlennyye = self.msg_cache.append_messages(contact.user_id, novyye)
+        if not dobavlennyye:
+            return
+        if self.cur_contact and self.cur_contact.user_id == contact.user_id:
+            for msg in dobavlennyye:
+                kopiya = dict(msg)
+                otpravitel = kopiya.get('sender_login')
+                login_dlya_decrypt = (kopiya.get('receiver_login')
+                                      if otpravitel == self.main_window.current_user
+                                      else otpravitel)
+                self._process_e2ee_msg(kopiya, login_dlya_decrypt)
+                self.web_view.page().runJavaScript(
+                    f'appendMessage({json.dumps(self.prepare_msg_for_display(kopiya))});')
+            self.ensure_msg_previews(contact.user_id, dobavlennyye)
+
     def preload_all_imgs(self):
-        for contact_login in self.contacts:
-            messages = self.msg_cache.load_messages(contact_login)
-            for msg in messages:
+        for kontakt in self.contacts.values():
+            for msg in self.msg_cache.load_messages(kontakt.user_id):
                 if msg.get('has_file') and msg.get('file_info') and msg['file_info'].get('is_image_only'):
                     file_id = msg['file_info']['id']
                     if not messenger_api.file_cache or not messenger_api.file_cache.has_file(file_id):
-                        self._load_file_preview_bg(file_id, msg['id'], contact_login)
+                        self._load_file_preview_bg(file_id, msg['id'], kontakt.user_id)
 
-    def _load_file_preview_bg(self, file_id, message_id, contact_login):
-        def handle_response(response):
-            if response and response.get('success'):
-                file_data = base64.b64decode(response.get('file_data'))
-                messages = self.msg_cache.load_messages(contact_login)
-                for msg in messages:
-                    if msg.get('id') == message_id and msg.get('file_info'):
-                        thumbnail = self._gen_thumbnail(file_data)
-                        if messenger_api.file_cache:
-                            messenger_api.file_cache.save_file(
-                                file_id,
-                                msg['file_info'].get('name', 'unknown'),
-                                msg['file_info'].get('type', 'application/octet-stream'),
-                                msg['file_info'].get('size', 0),
-                                file_data,
-                                thumbnail
-                            )
+    def ensure_msg_previews(self, contact_user_id, soobshenia):
+        for msg in soobshenia:
+            if msg.get('has_file') and msg.get('file_info') and msg['file_info'].get('is_image_only'):
+                file_id = msg['file_info']['id']
+                if not messenger_api.file_cache or not messenger_api.file_cache.has_file(file_id):
+                    self._load_file_preview(file_id, msg['id'], contact_user_id)
+
+    def _load_file_preview(self, file_id, message_id, contact_user_id):
+        def handle_otvet(otvet):
+            if not otvet or not otvet.get('success'):
+                return
+            raw = base64.b64decode(otvet.get('file_data'))
+            for msg in self.msg_cache.load_messages(contact_user_id):
+                if msg.get('id') == message_id and msg.get('file_info'):
+                    otpravitel = msg.get('sender_login')
+                    self._ensure_sender_key_cached(otpravitel)
+                    dannyye = self._decrypt_file_bytes(raw, msg.get('file_info'),
+                                                       sender_login=otpravitel)
+                    if dannyye is None:
                         break
+                    prevyu = self._gen_thumbnail(dannyye)
+                    if messenger_api.file_cache:
+                        messenger_api.file_cache.save_file(
+                            file_id,
+                            msg['file_info'].get('name', 'unknown'),
+                            msg['file_info'].get('type', 'application/octet-stream'),
+                            msg['file_info'].get('size', 0),
+                            dannyye, prevyu)
+                    if prevyu:
+                        prevyu_b64 = base64.b64encode(prevyu).decode('utf-8')
+                        self.web_view.page().runJavaScript(
+                            f'updateMessageThumbnail({message_id}, "{prevyu_b64}");')
+                    break
 
         make_server_request_async('get_file', {
             'user_token': self.main_window.user_token,
@@ -666,93 +879,38 @@ class ChatWindow(QWidget):
             'file_id': file_id,
             'include_data': True,
             'session_token': self.main_window.session_token
-        }, handle_response)
+        }, handle_otvet)
 
-    def sync_all_contacts(self):
-        for contact_login in self.contacts:
-            self.sync_contact_msgs(contact_login)
-        self.preload_all_imgs()
-
-    def _handle_messages_since_response(self, contact_login, response):
-        if response and response.get('success'):
-            new_messages = response.get('messages', [])
-            if new_messages:
-                self.msg_cache.append_messages(contact_login, new_messages)
-
-                if self.cur_contact and self.cur_contact.login == contact_login:
-                    for msg in new_messages:
-                        sender = msg.get('sender_login')
-                        if sender == self.main_window.current_user:
-                            login_for_decrypt = msg.get('receiver_login')
-                        else:
-                            login_for_decrypt = sender
-                        self._process_e2ee_msg(msg, login_for_decrypt)
-                        msg_display = self.prepare_msg_for_display(msg)
-                        self.web_view.page().runJavaScript(f'appendMessage({json.dumps(msg_display)});')
-                    self.ensure_msg_previews(contact_login, new_messages)
-
-    def sync_contact_msgs(self, contact_login):
-        last_id = self.msg_cache.get_last_message_id(contact_login)
-
-        make_server_request_async('get_messages_since', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'contact_login': contact_login,
-            'since_id': last_id,
-            'session_token': self.main_window.session_token
-        }, lambda resp: self._handle_messages_since_response(contact_login, resp))
-
-    def load_contact_avatars(self):
-        for contact in self.contacts.values():
-            self.load_contact_avatar(contact)
-
-    def load_contact_avatar(self, contact, force_download=False):
-        if (messenger_api.network_manager.has_avatar_cached(contact.user_id, contact.avatar_version)
-                and not force_download):
-            avatar_data = messenger_api.network_manager.get_avatar_from_cache(
-                contact.user_id, contact.avatar_version
-            )
-            if avatar_data:
-                pixmap = QPixmap()
-                pixmap.loadFromData(avatar_data)
-                self.contact_avatars[contact.login] = pixmap
-                self._update_avatar_in_js(contact.login)
+    def _load_file_preview_bg(self, file_id, message_id, contact_user_id):
+        def handle_otvet(otvet):
+            if not otvet or not otvet.get('success'):
                 return
+            raw = base64.b64decode(otvet.get('file_data'))
+            for msg in self.msg_cache.load_messages(contact_user_id):
+                if msg.get('id') == message_id and msg.get('file_info'):
+                    otpravitel = msg.get('sender_login')
+                    self._ensure_sender_key_cached(otpravitel)
+                    dannyye = self._decrypt_file_bytes(raw, msg.get('file_info'),
+                                                       sender_login=otpravitel)
+                    if dannyye is None:
+                        break
+                    prevyu = self._gen_thumbnail(dannyye)
+                    if messenger_api.file_cache:
+                        messenger_api.file_cache.save_file(
+                            file_id,
+                            msg['file_info'].get('name', 'unknown'),
+                            msg['file_info'].get('type', 'application/octet-stream'),
+                            msg['file_info'].get('size', 0),
+                            dannyye, prevyu)
+                    break
 
-        def handle_avatar_response(response):
-            if response and response.get('success'):
-                avatar_data = response.get('avatar')
-                if avatar_data:
-                    avatar_bytes = base64.b64decode(avatar_data)
-                    messenger_api.network_manager.save_avatar_to_cache(
-                        contact.user_id, contact.avatar_version, avatar_bytes
-                    )
-                    if contact.avatar_version > 0:
-                        messenger_api.network_manager.remove_old_avatar(
-                            contact.user_id, contact.avatar_version - 1
-                        )
-
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(avatar_bytes)
-                    self.contact_avatars[contact.login] = pixmap
-                    self._update_avatar_in_js(contact.login)
-
-        make_server_request_async('get_avatar', {
+        make_server_request_async('get_file', {
             'user_token': self.main_window.user_token,
             'user_id': self.main_window.user_id,
-            'target_user_id': contact.user_id,
+            'file_id': file_id,
+            'include_data': True,
             'session_token': self.main_window.session_token
-        }, handle_avatar_response)
-
-    def _handle_settings_response(self, response):
-        if response and response.get('success'):
-            settings = response.get('settings', {})
-            for contact_login, setting in settings.items():
-                if contact_login in self.contacts:
-                    display_name = setting.get('display_name')
-                    if display_name:
-                        self.contacts[contact_login].display_name = display_name
-            self._update_contacts_js()
+        }, handle_otvet)
 
     def load_contact_settings(self):
         make_server_request_async('get_contact_settings', {
@@ -761,62 +919,108 @@ class ChatWindow(QWidget):
             'session_token': self.main_window.session_token
         }, self._handle_settings_response)
 
-    def prepare_msg_for_display(self, msg):
-        msg_copy = dict(msg)
-        text = msg_copy.get('decrypted_text', msg_copy.get('message_text', ''))
-        if text:
-            escaped = html.escape(text)
-            html_text = markdown.markdown(escaped, extensions=['nl2br', 'tables'])
-            allowed_tags = [
-                'p', 'br', 'strong', 'em', 'u', 'a', 'ul', 'ol', 'li',
-                'blockquote', 'code', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
-            ]
-            allowed_attrs = {'a': ['href', 'title']}
-            safe_html = bleach.clean(html_text, tags=allowed_tags, attributes=allowed_attrs)
-            msg_copy['message_text'] = safe_html
+    def _handle_settings_response(self, otvet):
+        if otvet and otvet.get('success'):
+            nastroyki = otvet.get('settings', {})
+            obnovleno = False
+            for login, setting in nastroyki.items():
+                if login in self.contacts:
+                    imya = setting.get('display_name')
+                    if imya and self.contacts[login].display_name != imya:
+                        self.contacts[login].display_name = imya
+                        obnovleno = True
+            if obnovleno:
+                self._update_contacts_js()
+                self._save_settings_cache()
+                if self.cur_contact and self.cur_contact.login in nastroyki:
+                    novoe_imya = nastroyki[self.cur_contact.login].get('display_name')
+                    if novoe_imya:
+                        self.cur_contact.display_name = novoe_imya
+                        safe_name = html.escape(novoe_imya).replace('"', '\\"').replace("'", "\\'")
+                        self.web_view.page().runJavaScript(
+                            f'document.getElementById("chatName").textContent = "{safe_name}";')
+            self._save_settings_cache()
+            self.settings_retry_count = 0
         else:
-            msg_copy['message_text'] = ''
+            if self.settings_retry_count < 3:
+                self.settings_retry_count += 1
+                QTimer.singleShot(1500, self.load_contact_settings)
 
-        if msg_copy.get('has_file') and msg_copy.get('file_info'):
-            file_info = msg_copy['file_info']
-            msg_copy['is_image_only'] = file_info.get('is_image_only', False)
-            if file_info.get('is_image_only') and file_info['type'].startswith('image/'):
+    def _load_cached_settings(self):
+        kesh = self.msg_cache.load_contact_settings_cache()
+        obnovleno = False
+        for login, imya in kesh.items():
+            if login in self.contacts and self.contacts[login].display_name != imya:
+                self.contacts[login].display_name = imya
+                obnovleno = True
+        if obnovleno:
+            self._update_contacts_js()
+            if self.cur_contact and self.cur_contact.login in kesh:
+                self.web_view.page().runJavaScript(
+                    f'document.getElementById("chatName").textContent = '
+                    f'"{html.escape(kesh[self.cur_contact.login])}";')
+
+    def _save_settings_cache(self):
+        self.msg_cache.save_contact_settings_cache({
+            login: c.display_name
+            for login, c in self.contacts.items()
+            if c.display_name and c.display_name != c.username
+        })
+
+    def prepare_msg_for_display(self, msg):
+        kopiya = dict(msg)
+        tekst = kopiya.get('decrypted_text', kopiya.get('message_text', ''))
+        if tekst:
+            html_tekst = markdown.markdown(tekst, extensions=['nl2br', 'tables'])
+            allowed_tags = ['p', 'br', 'strong', 'em', 'u', 'a', 'ul', 'ol', 'li',
+                            'blockquote', 'code', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']
+            allowed_attrs = {'a': ['href', 'title']}
+            kopiya['message_text'] = bleach.clean(
+                html_tekst, tags=allowed_tags, attributes=allowed_attrs,
+                strip=True, protocols=['http', 'https', 'mailto'])
+        else:
+            kopiya['message_text'] = ''
+
+        if kopiya.get('has_file') and kopiya.get('file_info'):
+            fi = kopiya['file_info']
+            fi['sender_login'] = kopiya.get('sender_login', '')
+            fi.setdefault('is_encrypted', False)
+            fi.setdefault('encrypted_key', None)
+            fi.setdefault('nonce_file', None)
+            kopiya['is_image_only'] = fi.get('is_image_only', False)
+            if fi.get('is_image_only') and fi['type'].startswith('image/'):
                 if messenger_api.file_cache:
-                    file_data = messenger_api.file_cache.get_file_data(file_info['id'])
-                    if file_data:
-                        thumbnail = messenger_api.file_cache.get_thumbnail_data(file_info['id'])
-                        if thumbnail:
-                            file_info['thumbnail'] = base64.b64encode(thumbnail).decode('utf-8')
+                    dannyye = messenger_api.file_cache.get_file_data(fi['id'])
+                    if dannyye:
+                        prevyu = messenger_api.file_cache.get_thumbnail_data(fi['id'])
+                        if prevyu:
+                            fi['thumbnail'] = base64.b64encode(prevyu).decode('utf-8')
             else:
-                file_info['icon'] = self.get_file_icon(file_info['type'])
-                file_info['size_kb'] = round(file_info['size'] / 1024, 1)
+                fi['icon'] = self.get_file_icon(fi['type'])
+                fi['size_kb'] = round(fi['size'] / 1024, 1)
 
-        timestamp = msg_copy.get('timestamp', '')
-        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        dt = dt + timedelta(hours=3)
-        msg_copy['display_time'] = dt.strftime("%d.%m %H:%M")
-
-        return msg_copy
+        dt = datetime.fromisoformat(kopiya.get('timestamp', '').replace('Z', '+00:00'))
+        kopiya['display_time'] = (dt + timedelta(hours=3)).strftime("%d.%m %H:%M")
+        return kopiya
 
     def get_file_icon(self, file_type):
         if file_type.startswith('image/'):
             return '🖼️'
-        elif file_type.startswith('video/'):
+        if file_type.startswith('video/'):
             return '🎬'
-        elif file_type.startswith('audio/'):
+        if file_type.startswith('audio/'):
             return '🎵'
-        elif file_type == 'application/pdf':
+        if file_type == 'application/pdf':
             return '📕'
-        elif 'word' in file_type or 'document' in file_type:
+        if 'word' in file_type or 'document' in file_type:
             return '📘'
-        elif 'excel' in file_type or 'sheet' in file_type:
+        if 'excel' in file_type or 'sheet' in file_type:
             return '📗'
-        elif 'presentation' in file_type or 'powerpoint' in file_type:
+        if 'presentation' in file_type or 'powerpoint' in file_type:
             return '📙'
-        elif 'text' in file_type:
+        if 'text' in file_type:
             return '📄'
-        else:
-            return '📎'
+        return '📎'
 
     def _gen_thumbnail(self, image_data, max_size=(400, 400)):
         from PIL import Image
@@ -825,92 +1029,52 @@ class ChatWindow(QWidget):
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
         if img.mode in ('RGBA', 'LA', 'P'):
             img = img.convert('RGB')
-        output = io.BytesIO()
-        img.save(output, format='JPEG', quality=70, optimize=True)
-        return output.getvalue()
-
-    def ensure_msg_previews(self, contact_login, messages):
-        for msg in messages:
-            if msg.get('has_file') and msg.get('file_info') and msg['file_info'].get('is_image_only'):
-                file_id = msg['file_info']['id']
-                if not messenger_api.file_cache or not messenger_api.file_cache.has_file(file_id):
-                    self._load_file_preview(file_id, msg['id'], contact_login)
-
-    def _load_file_preview(self, file_id, message_id, contact_login):
-        def handle_response(response):
-            if response and response.get('success'):
-                file_data = base64.b64decode(response.get('file_data'))
-                messages = self.msg_cache.load_messages(contact_login)
-                for msg in messages:
-                    if msg.get('id') == message_id and msg.get('file_info'):
-                        thumbnail = self._gen_thumbnail(file_data)
-                        if messenger_api.file_cache:
-                            messenger_api.file_cache.save_file(
-                                file_id,
-                                msg['file_info'].get('name', 'unknown'),
-                                msg['file_info'].get('type', 'application/octet-stream'),
-                                msg['file_info'].get('size', 0),
-                                file_data,
-                                thumbnail
-                            )
-                        if thumbnail:
-                            thumbnail_b64 = base64.b64encode(thumbnail).decode('utf-8')
-                            self.web_view.page().runJavaScript(
-                                f'updateMessageThumbnail({message_id}, "{thumbnail_b64}");')
-                        break
-
-        make_server_request_async('get_file', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'file_id': file_id,
-            'include_data': True,
-            'session_token': self.main_window.session_token
-        }, handle_response)
+        vyvod = io.BytesIO()
+        img.save(vyvod, format='JPEG', quality=70, optimize=True)
+        return vyvod.getvalue()
 
     def _update_contacts_js(self):
         if not self.page_loaded:
+            self.contacts_need_update = True
             return
-        contacts_list = []
-        for contact in self.contacts.values():
-            avatar_data = self._get_avatar_data(contact.login)
-            safe_display_name = html.escape(contact.get_display_name()) if contact.get_display_name() else contact.login
-            contacts_list.append({
-                'login': contact.login,
-                'username': contact.username,
-                'display_name': safe_display_name,
-                'avatar': avatar_data
-            })
-        self.web_view.page().runJavaScript(f'setContacts({json.dumps(contacts_list)});')
+        spisok = [
+            {
+                'login': c.login,
+                'username': c.username,
+                'display_name': html.escape(c.get_display_name()) if c.get_display_name() else c.login,
+                'avatar': self._get_avatar_data(c.login)
+            }
+            for c in self.contacts.values()
+        ]
+        self.web_view.page().runJavaScript(f'setContacts({json.dumps(spisok)});')
+        self.contacts_need_update = False
 
     def _update_avatar_in_js(self, login):
         if not self.page_loaded:
             return
-        avatar_data = self._get_avatar_data(login)
-        if avatar_data:
-            self.web_view.page().runJavaScript(f'updateContactAvatar("{login}", "{avatar_data}");')
+        dannyye = self._get_avatar_data(login)
+        if dannyye:
+            self.web_view.page().runJavaScript(f'updateContactAvatar("{login}", "{dannyye}");')
 
     def _get_avatar_data(self, login):
         pixmap = self.contact_avatars.get(login)
         if pixmap and not pixmap.isNull():
             byte_array = QByteArray()
-            buffer = QBuffer(byte_array)
-            buffer.open(QBuffer.OpenModeFlag.WriteOnly)
-            pixmap.save(buffer, "PNG")
+            buf = QBuffer(byte_array)
+            buf.open(QBuffer.OpenModeFlag.WriteOnly)
+            pixmap.save(buf, "PNG")
             return 'data:image/png;base64,' + byte_array.toBase64().data().decode()
-        else:
-            return self._get_default_avatar_data()
+        return self._get_default_avatar_data()
 
     def _get_default_avatar_data(self):
         default_path = self.script_dir / "images" / "default_avatar.jpg"
-        if default_path.exists():
-            pixmap = QPixmap(str(default_path))
-        else:
-            pixmap = QPixmap(60, 60)
+        pixmap = QPixmap(str(default_path)) if default_path.exists() else QPixmap(60, 60)
+        if not default_path.exists():
             pixmap.fill(Qt.GlobalColor.gray)
         byte_array = QByteArray()
-        buffer = QBuffer(byte_array)
-        buffer.open(QBuffer.OpenModeFlag.WriteOnly)
-        pixmap.save(buffer, "PNG")
+        buf = QBuffer(byte_array)
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        pixmap.save(buf, "PNG")
         return 'data:image/png;base64,' + byte_array.toBase64().data().decode()
 
     def closeEvent(self, event):

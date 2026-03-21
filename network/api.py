@@ -10,6 +10,7 @@ from network.crypto import (
     E2EEMasterKey, E2EEContactManager, E2EEMessageHandler,
     gen_msg_master_key, encrypt_master_key, decrypt_master_key
 )
+from network.transport import AsyncHTTPRequest
 
 
 class MessengerAPI:
@@ -33,6 +34,12 @@ class MessengerAPI:
             device_id = str(uuid.uuid4())
             settings.setValue("device_id", device_id)
         self.device_id = device_id
+
+    def get_user_info(self, token, user_id, target_login):
+        data = {'user_token': token, 'user_id': user_id, 'target_login': target_login}
+        if self.network_manager.session_token:
+            data['session_token'] = self.network_manager.session_token
+        return self.network_manager.send_sync_request('get_user_info', data)
 
     def set_user_credentials(self, session_token, user_id, user_login=None):
         if user_login is not None:
@@ -157,7 +164,9 @@ class MessengerAPI:
         aesgcm = AESGCM(self.e2ee_master_key.encryption_key)
         return aesgcm.decrypt(nonce, cipher, None)
 
-    def encrypt_file_data(self, file_data, thumbnail_data):
+    def encrypt_file_data(self, file_data, thumbnail_data, receiver_login=None):
+        if not self.e2ee_master_key:
+            raise Exception("E2EE не инициализирован")
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         file_key = os.urandom(32)
 
@@ -165,11 +174,26 @@ class MessengerAPI:
         aesgcm = AESGCM(file_key)
         ciphertext = aesgcm.encrypt(nonce_file, file_data, None)
 
+        encrypted_key_sender = self._encrypt_file_key(file_key)
+        encrypted_key_receiver = None
+        if receiver_login and self.e2ee_contact_manager:
+            receiver_pub = self.e2ee_contact_manager.contact_keys.get(receiver_login)
+            if receiver_pub:
+                try:
+                    encrypted_key_receiver = self.e2ee_master_key.encrypt_file_key_for_recipient(
+                        file_key, receiver_pub
+                    )
+                except Exception as e:
+                    print(f"File key ECDH encrypt error: {e}")
+
+        key_bundle = {'s': encrypted_key_sender}
+        if encrypted_key_receiver:
+            key_bundle['r'] = encrypted_key_receiver
+
         result = {
             'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
             'nonce_file': base64.b64encode(nonce_file).decode('utf-8'),
-            'encrypted_key': self._encrypt_file_key(file_key),
-            'file_key': base64.b64encode(file_key).decode('utf-8')
+            'encrypted_key': json.dumps(key_bundle),
         }
 
         if thumbnail_data:
@@ -180,9 +204,32 @@ class MessengerAPI:
 
         return result
 
-    def decrypt_file_data(self, ciphertext, nonce, encrypted_key):
+    def _resolve_file_key(self, encrypted_key_str, sender_login=None):
+        if not self.e2ee_master_key:
+            raise Exception("E2EE не инициализирован")
+
+        try:
+            bundle = json.loads(encrypted_key_str)
+            if isinstance(bundle, dict):
+                if 's' in bundle:
+                    try:
+                        return self._decrypt_file_key(bundle['s'])
+                    except Exception:
+                        pass
+
+                if 'r' in bundle and sender_login and self.e2ee_contact_manager:
+                    sender_pub = self.e2ee_contact_manager.contact_keys.get(sender_login)
+                    if sender_pub:
+                        return self.e2ee_master_key.decrypt_file_key_from_sender(
+                            bundle['r'], sender_pub
+                        )
+        except (json.JSONDecodeError, Exception):
+            pass
+        return self._decrypt_file_key(encrypted_key_str)
+
+    def decrypt_file_data(self, ciphertext, nonce, encrypted_key, sender_login=None):
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        file_key = self._decrypt_file_key(encrypted_key)
+        file_key = self._resolve_file_key(encrypted_key, sender_login)
         aesgcm = AESGCM(file_key)
         return aesgcm.decrypt(nonce, ciphertext, None)
 
@@ -444,9 +491,19 @@ messenger_api = MessengerAPI()
 
 
 def make_server_request_async(endpoint, data=None, callback=None):
+    # -- асинхронный запрос
     if data is None:
         data = {}
     if callback is None:
         callback = lambda x: None
-    response = messenger_api.network_manager.send_sync_request(endpoint, data)
-    callback(response)
+
+    payload = dict(data)
+    nm = messenger_api.network_manager
+    if nm.session_token and 'session_token' not in payload:
+        payload['session_token'] = nm.session_token
+    if nm.user_token and 'user_token' not in payload:
+        payload['user_token'] = nm.user_token
+    if nm.user_id and 'user_id' not in payload:
+        payload['user_id'] = nm.user_id
+
+    AsyncHTTPRequest(endpoint, payload, callback)
