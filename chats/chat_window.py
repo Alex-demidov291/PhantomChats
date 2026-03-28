@@ -35,6 +35,10 @@ class Bridge(QObject):
     def loadUserData(self):
         self.chat_window.load_user_data()
 
+    @pyqtSlot(str, bool)
+    def confirmKeyChange(self, contact_login, accepted):
+        self.chat_window.confirm_key_change(contact_login, accepted)
+
     @pyqtSlot(str)
     def loadMessages(self, contact_login):
         self.chat_window.load_messages(contact_login)
@@ -86,12 +90,9 @@ class MessageCache:
         fayl = self._get_contact_file(contact_user_id)
         if not fayl.exists():
             return []
-        try:
-            with open(fayl, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get('messages', [])
-        except (json.JSONDecodeError, OSError):
-            return []
+        with open(fayl, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get('messages', [])
 
     def save_messages(self, contact_user_id, messages):
         fayl = self._get_contact_file(contact_user_id)
@@ -121,32 +122,23 @@ class MessageCache:
         fayl = self._get_contact_file(contact_user_id)
         if not fayl.exists():
             return 0
-        try:
-            with open(fayl, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get('last_message_id', 0)
-        except (json.JSONDecodeError, OSError):
-            return 0
+        with open(fayl, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get('last_message_id', 0)
 
     def clear_cache(self):
         shutil.rmtree(self.cache_dir, ignore_errors=True)
 
     def save_contact_settings_cache(self, nastroyki):
         fayl = self.cache_dir / "contact_settings.json"
-        try:
-            with open(fayl, 'w', encoding='utf-8') as f:
-                json.dump(nastroyki, f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+        with open(fayl, 'w', encoding='utf-8') as f:
+            json.dump(nastroyki, f, ensure_ascii=False, indent=2)
 
     def load_contact_settings_cache(self):
         fayl = self.cache_dir / "contact_settings.json"
         if fayl.exists():
-            try:
-                with open(fayl, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+            with open(fayl, 'r', encoding='utf-8') as f:
+                return json.load(f)
         return {}
 
 
@@ -154,6 +146,8 @@ class ChatWindow(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
+        self.session_id = main_window.session_id
+        self.user_id = main_window.user_id
         self.cur_contact = None
         self.contacts = {}
         self.contact_avatars = {}
@@ -178,6 +172,47 @@ class ChatWindow(QWidget):
         self.setup_msg_listener()
         self.avatar_timer.start()
         self.sync_timer.start()
+
+    def init_e2ee_handlers(self):
+        if messenger_api.e2ee_contact_manager:
+            messenger_api.e2ee_contact_manager.key_changed.connect(self.on_key_changed)
+
+    def on_key_changed(self, contact_login, old_key_b64, new_key_b64, new_key_bytes):
+        contact = self.contacts.get(contact_login)
+        if not contact:
+            return
+        safe_contact = html.escape(contact.get_display_name())
+
+        self.web_view.page().runJavaScript(f"""
+            showKeyChangeDialog(
+                '{contact_login}',
+                '{safe_contact}',
+                '{old_key_b64[:16]}...',
+                '{new_key_b64[:16]}...',
+                function(accepted) {{
+                    if (window.qt) {{
+                        if (accepted) {{
+                            window.qt.confirmKeyChange('{contact_login}', true);
+                        }} else {{
+                            window.qt.confirmKeyChange('{contact_login}', false);
+                        }}
+                    }}
+                }}
+            );
+        """)
+
+    def confirm_key_change(self, contact_login, accepted):
+        if messenger_api.e2ee_contact_manager:
+            messenger_api.e2ee_contact_manager.confirm_key_change(contact_login, accepted)
+            if accepted:
+                self.fetch_contact_pubkey(self.contacts.get(contact_login))
+                self.web_view.page().runJavaScript(
+                    f'showToast("Ключ контакта {html.escape(contact_login)} обновлен");'
+                )
+            else:
+                self.web_view.page().runJavaScript(
+                    f'showToast("Смена ключа для {html.escape(contact_login)} отклонена. Сообщения не будут расшифровываться.", true);'
+                )
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -236,9 +271,10 @@ class ChatWindow(QWidget):
     def fetch_contact_pubkey(self, contact):
         if not messenger_api.e2ee_contact_manager:
             return
-        kluch = messenger_api.e2ee_contact_manager.get_contact_public_key(contact.login)
-        if kluch:
-            contact.public_key = kluch
+        if contact.login in messenger_api.e2ee_contact_manager.contact_keys:
+            contact.public_key = messenger_api.e2ee_contact_manager.contact_keys[contact.login]
+            return
+        self._prefetch_key_then(contact, lambda: None)
 
     def _prefetch_key_then(self, contact, callback):
         if not messenger_api.e2ee_contact_manager:
@@ -252,23 +288,17 @@ class ChatWindow(QWidget):
 
         def handle_key_otvet(otvet):
             if otvet and otvet.get('success'):
-                try:
-                    kluch = messenger_api.e2ee_contact_manager.process_key_response(contact.login, otvet)
-                    if kluch:
-                        contact.public_key = kluch
-                except KeyChangedError as e:
-                    contact.public_key = e.new_key_bytes
-                    safe_login = html.escape(contact.login).replace('"', '\\"')
-                    self.web_view.page().runJavaScript(
-                        f'showToast("⚠ Ключ {safe_login} изменился. Проверьте безопасность.", true);'
-                    )
+                messenger_api.e2ee_contact_manager.process_key_response(contact.login, otvet)
+                if contact.login in messenger_api.e2ee_contact_manager.contact_keys:
+                    contact.public_key = messenger_api.e2ee_contact_manager.contact_keys[contact.login]
+                else:
+                    contact.public_key = None
             callback()
 
         make_server_request_async('get_public_key', {
             'contact_login': contact.login,
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, handle_key_otvet)
 
     def _process_e2ee_msg(self, msg, contact_login):
@@ -302,12 +332,9 @@ class ChatWindow(QWidget):
         nonce_file = file_info.get('nonce_file')
         if not encrypted_key or not nonce_file or not messenger_api.e2ee_master_key:
             return None
-        try:
-            nonce_bytes = base64.b64decode(nonce_file)
-            return messenger_api.decrypt_file_data(raw_bytes, nonce_bytes, encrypted_key,
-                                                   sender_login=sender_login)
-        except Exception:
-            return None
+        nonce_bytes = base64.b64decode(nonce_file)
+        return messenger_api.decrypt_file_data(raw_bytes, nonce_bytes, encrypted_key,
+                                               sender_login=sender_login)
 
     def _ensure_sender_key_cached(self, sender_login):
         if not sender_login or not messenger_api.e2ee_contact_manager:
@@ -327,10 +354,9 @@ class ChatWindow(QWidget):
         kontakt = self.contacts.get(contact_login)
         if not kontakt:
             make_server_request_async('get_user_info', {
-                'user_token': self.main_window.user_token,
-                'user_id': self.main_window.user_id,
+                'session_id': self.session_id,
+                'user_id': self.user_id,
                 'target_login': contact_login,
-                'session_token': self.main_window.session_token
             }, lambda otvet: self._handle_user_info_response(contact_login, otvet))
             return
         self._load_messages_after_contact(kontakt)
@@ -408,25 +434,14 @@ class ChatWindow(QWidget):
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
-        try:
-            handle_send_otvet(messenger_api.send_message(
-                token=self.main_window.user_token,
-                user_id=self.main_window.user_id,
-                receiver_login=receiver_login,
-                text=text,
-                file_id=None
-            ))
-        except KeyChangedError:
-            safe_login = html.escape(receiver_login).replace('"', '\\"')
-            self.web_view.page().runJavaScript(
-                f'showToast("Ключ {safe_login} изменился. Проверьте безопасность.", true);')
-            handle_send_otvet(messenger_api.send_message(
-                token=self.main_window.user_token,
-                user_id=self.main_window.user_id,
-                receiver_login=receiver_login,
-                text=text,
-                file_id=None
-            ))
+        result = messenger_api.send_message(
+            session_id=self.session_id,
+            user_id=self.user_id,
+            receiver_login=receiver_login,
+            text=text,
+            file_id=None
+        )
+        handle_send_otvet(result)
 
     def attach_file(self, params_json):
         if not self.cur_contact:
@@ -460,6 +475,8 @@ class ChatWindow(QWidget):
         with open(put_fayla, 'rb') as f:
             dannyye = f.read()
 
+        login_poluchatelya = self.cur_contact.login
+
         def handle_upload_otvet(otvet):
             self.web_view.page().runJavaScript('showProgress(100);')
             if otvet and otvet.get('success'):
@@ -470,30 +487,46 @@ class ChatWindow(QWidget):
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
-        payload = {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'file_name': imya_fayla,
-            'file_type': tip_fayla,
-            'is_image_only': tolko_kartinka,
-            'session_token': self.main_window.session_token
-        }
+        if messenger_api.e2ee_master_key and messenger_api.e2ee_contact_manager:
+            def on_encryption_complete(encrypted_data):
+                if encrypted_data:
+                    payload = {
+                        'session_id': self.session_id,
+                        'user_id': self.user_id,
+                        'file_name': imya_fayla,
+                        'file_type': tip_fayla,
+                        'is_image_only': tolko_kartinka,
+                        'file_data': encrypted_data['ciphertext'],
+                        'encrypted_key': encrypted_data['encrypted_key'],
+                        'nonce_file': encrypted_data['nonce_file'],
+                        'is_encrypted': 1
+                    }
+                    if 'thumbnail' in encrypted_data:
+                        payload['thumbnail'] = encrypted_data['thumbnail']
+                    if 'nonce_thumbnail' in encrypted_data:
+                        payload['nonce_thumbnail'] = encrypted_data['nonce_thumbnail']
 
-        login_poluchatelya = self.cur_contact.login
-        pub_poluchatelya = (messenger_api.e2ee_contact_manager.contact_keys.get(login_poluchatelya)
-                            if messenger_api.e2ee_master_key and messenger_api.e2ee_contact_manager
-                            else None)
+                    make_server_request_async('upload_file', payload, handle_upload_otvet)
+                else:
+                    self.web_view.page().runJavaScript('showProgress(100);')
+                    self.web_view.page().runJavaScript('showToast("Ошибка шифрования файла", true);')
 
-        if pub_poluchatelya:
-            enc = messenger_api.encrypt_file_data(dannyye, None, receiver_login=login_poluchatelya)
-            payload['file_data'] = enc['ciphertext']
-            payload['encrypted_key'] = enc['encrypted_key']
-            payload['nonce_file'] = enc['nonce_file']
-            payload['is_encrypted'] = 1
+            messenger_api.encrypt_file_data(
+                dannyye,
+                None,
+                receiver_login=login_poluchatelya,
+                callback=on_encryption_complete
+            )
         else:
-            payload['file_data'] = base64.b64encode(dannyye).decode('utf-8')
-
-        make_server_request_async('upload_file', payload, handle_upload_otvet)
+            payload = {
+                'session_id': self.session_id,
+                'user_id': self.user_id,
+                'file_name': imya_fayla,
+                'file_type': tip_fayla,
+                'is_image_only': tolko_kartinka,
+                'file_data': base64.b64encode(dannyye).decode('utf-8')
+            }
+            make_server_request_async('upload_file', payload, handle_upload_otvet)
 
     def _send_msg_with_file(self, file_id, text, file_name, file_type, is_image_only):
         polnyy_tekst = text if text.strip() else ""
@@ -514,13 +547,14 @@ class ChatWindow(QWidget):
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
-        handle_send_otvet(messenger_api.send_message(
-            token=self.main_window.user_token,
-            user_id=self.main_window.user_id,
+        result = messenger_api.send_message(
+            session_id=self.session_id,
+            user_id=self.user_id,
             receiver_login=self.cur_contact.login,
             text=polnyy_tekst,
             file_id=file_id
-        ))
+        )
+        handle_send_otvet(result)
 
     def download_file(self, file_id, file_info):
         if messenger_api.file_cache and messenger_api.file_cache.has_file(file_id):
@@ -551,12 +585,11 @@ class ChatWindow(QWidget):
                     f'showToast("Не удалось загрузить файл: {safe_error}", true);')
 
         make_server_request_async('get_file', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'file_id': file_id,
             'include_data': True,
             'include_thumbnail': True,
-            'session_token': self.main_window.session_token
         }, handle_file_otvet)
 
     def save_file_dialog(self, file_name, dannyye):
@@ -605,19 +638,17 @@ class ChatWindow(QWidget):
             self.web_view.page().runJavaScript('showToast("Этот пользователь уже в контактах!", true);')
             return
         make_server_request_async('add_contact', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'contact_login': contact_login,
-            'session_token': self.main_window.session_token
         }, lambda otvet: self._handle_add_contact_response(contact_login, otvet))
 
     def _handle_add_contact_response(self, contact_login, otvet):
         if otvet and otvet.get('success'):
             make_server_request_async('get_user_info', {
-                'user_token': self.main_window.user_token,
-                'user_id': self.main_window.user_id,
+                'session_id': self.session_id,
+                'user_id': self.user_id,
                 'target_login': contact_login,
-                'session_token': self.main_window.session_token
             }, lambda resp: self._handle_add_contact_info(contact_login, resp))
         else:
             oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
@@ -642,10 +673,9 @@ class ChatWindow(QWidget):
 
     def delete_chat(self, contact_login):
         make_server_request_async('remove_contact', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'contact_login': contact_login,
-            'session_token': self.main_window.session_token
         }, lambda otvet: self._handle_remove_contact_response(contact_login, otvet))
 
     def _handle_remove_contact_response(self, contact_login, otvet):
@@ -665,11 +695,10 @@ class ChatWindow(QWidget):
             self.web_view.page().runJavaScript('showToast("Имя не может быть длиннее 64 символов", true);')
             return
         make_server_request_async('save_contact_settings', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'contact_login': contact_login,
             'display_name': new_name,
-            'session_token': self.main_window.session_token
         }, lambda otvet: self._handle_rename_contact_response(contact_login, new_name, otvet))
 
     def _handle_rename_contact_response(self, contact_login, new_name, otvet):
@@ -720,10 +749,9 @@ class ChatWindow(QWidget):
         if not nuzhno_proverit:
             return
         make_server_request_async('get_avatar_versions', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'user_ids': [c.user_id for c in nuzhno_proverit],
-            'session_token': self.main_window.session_token
         }, lambda otvet: self._handle_avatar_versions_response(nuzhno_proverit, otvet))
 
     def _handle_avatar_versions_response(self, nuzhno_proverit, otvet):
@@ -766,17 +794,15 @@ class ChatWindow(QWidget):
                 self._update_avatar_in_js(contact.login)
 
         make_server_request_async('get_avatar', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'target_user_id': contact.user_id,
-            'session_token': self.main_window.session_token
         }, handle_avatar_otvet)
 
     def load_contacts(self):
         make_server_request_async('get_contacts', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, self._handle_contacts_response)
 
     def _handle_contacts_response(self, otvet):
@@ -803,11 +829,10 @@ class ChatWindow(QWidget):
     def sync_contact_msgs(self, contact):
         last_id = self.msg_cache.get_last_message_id(contact.user_id)
         make_server_request_async('get_messages_since', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'contact_login': contact.login,
             'since_id': last_id,
-            'session_token': self.main_window.session_token
         }, lambda otvet: self._handle_messages_since_response(contact, otvet))
 
     def _handle_messages_since_response(self, contact, otvet):
@@ -874,11 +899,10 @@ class ChatWindow(QWidget):
                     break
 
         make_server_request_async('get_file', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'file_id': file_id,
             'include_data': True,
-            'session_token': self.main_window.session_token
         }, handle_otvet)
 
     def _load_file_preview_bg(self, file_id, message_id, contact_user_id):
@@ -905,18 +929,16 @@ class ChatWindow(QWidget):
                     break
 
         make_server_request_async('get_file', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'file_id': file_id,
             'include_data': True,
-            'session_token': self.main_window.session_token
         }, handle_otvet)
 
     def load_contact_settings(self):
         make_server_request_async('get_contact_settings', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, self._handle_settings_response)
 
     def _handle_settings_response(self, otvet):
@@ -1080,4 +1102,9 @@ class ChatWindow(QWidget):
     def closeEvent(self, event):
         self.avatar_timer.stop()
         self.sync_timer.stop()
+        if hasattr(self, 'status_manager'):
+            self.status_manager.stop()
+        if self.web_view:
+            self.web_view.stop()
+            self.web_view.setPage(None)
         super().closeEvent(event)

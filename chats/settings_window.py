@@ -17,72 +17,61 @@ from network import make_server_request_async, messenger_api
 
 
 class SettingsBridge(QObject):
-    # -- мост для связи с html
     def __init__(self, settings_window):
         super().__init__()
         self.settings_window = settings_window
 
     @pyqtSlot()
     def loadUserData(self):
-        # - загрузка данных юзера
         self.settings_window.load_user_data()
 
     @pyqtSlot(str)
     def changeName(self, new_name):
-        # - сменя имени
         self.settings_window.change_name(new_name)
 
     @pyqtSlot(str, str)
     def changePassword(self, new_password, confirm_password):
-        # - смена пароля
         self.settings_window.change_password(new_password, confirm_password)
 
     @pyqtSlot()
     def changeAvatar(self):
-        # - смена авы
         self.settings_window.change_avatar()
 
     @pyqtSlot()
     def showSessions(self):
-        # - показ сессий
         self.settings_window.show_sessions_dialog()
 
     @pyqtSlot()
     def showCleanup(self):
-        # - показ настроек очистки
         self.settings_window.show_cleanup_dialog()
 
     @pyqtSlot(str)
     def logoutSelectedSession(self, session_id):
-        # - выход из выбранной сессии
         self.settings_window.logout_selected_session(session_id)
 
     @pyqtSlot()
     def logoutAllSessions(self):
-        # - выход из всех сессий
         self.settings_window.logout_all_sessions()
 
     @pyqtSlot(int)
     def saveCleanupSettings(self, interval):
-        # - настройки очистки
         self.settings_window.save_cleanup_settings(interval)
 
     @pyqtSlot()
     def backToChat(self):
-        # - возврат в чат
         self.settings_window.show_chat_window()
 
     @pyqtSlot()
     def logout(self):
-        # - выход из аккаунта"
         self.settings_window.logout()
 
 
 class SettingsWindow(QWidget):
-    # -- окошко настроек
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
+        self.session_id = main_window.session_id
+        self.user_id = main_window.user_id
         self.cur_ava_path = defult_ava
         self.bridge = SettingsBridge(self)
         self.init_ui()
@@ -160,16 +149,14 @@ class SettingsWindow(QWidget):
                         self.web_view.page().runJavaScript('showDefaultAvatar();')
 
                 make_server_request_async('get_avatar', {
-                    'user_token': self.main_window.user_token,
-                    'user_id': self.main_window.user_id,
+                    'session_id': self.session_id,
+                    'user_id': self.user_id,
                     'target_user_id': user_id,
-                    'session_token': self.main_window.session_token
                 }, handle_avatar_response)
 
         make_server_request_async('info', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, handle_info_response)
 
     def change_name(self, new_name):
@@ -188,10 +175,9 @@ class SettingsWindow(QWidget):
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
         make_server_request_async('update_profile', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'username': new_name,
-            'session_token': self.main_window.session_token
         }, handle_change_name_response)
 
     def change_avatar(self):
@@ -223,11 +209,11 @@ class SettingsWindow(QWidget):
                     if avatar_data:
                         avatar_bytes = base64.b64decode(avatar_data)
                         messenger_api.network_manager.save_avatar_to_cache(
-                            self.main_window.user_id, avatar_version, avatar_bytes
+                            self.user_id, avatar_version, avatar_bytes
                         )
                         if avatar_version > 0:
                             messenger_api.network_manager.remove_old_avatar(
-                                self.main_window.user_id, avatar_version - 1
+                                self.user_id, avatar_version - 1
                             )
                         self.web_view.page().runJavaScript(f'updateAvatar("{avatar_data}");')
                     self.web_view.page().runJavaScript('showToast("Аватар успешно изменен!");')
@@ -237,10 +223,9 @@ class SettingsWindow(QWidget):
                     self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
             make_server_request_async('update_profile', {
-                'user_token': self.main_window.user_token,
-                'user_id': self.main_window.user_id,
+                'session_id': self.session_id,
+                'user_id': self.user_id,
                 'avatar': avatar_base64,
-                'session_token': self.main_window.session_token
             }, handle_change_avatar_response)
 
     def change_password(self, new_password, confirm_password):
@@ -294,17 +279,9 @@ class SettingsWindow(QWidget):
         def handle_sessions_response(response):
             if response and response.get('success'):
                 sessions = response.get('sessions', [])
-                formatted_sessions = []
-                for s in sessions:
-                    formatted_sessions.append({
-                        'session_id': s['session_id'],
-                        'created_at': s.get('created_at', ''),
-                        'last_used_at': s.get('last_used_at', ''),
-                        'expires_at': s.get('expires_at', ''),
-                        'is_active': s.get('is_active', False),
-                        'is_current': s.get('is_current', False)
-                    })
-                sessions_json = json.dumps(formatted_sessions)
+                # sessions will contain the hashed session_id (full hash) and other fields
+                # We need to pass them to JS
+                sessions_json = json.dumps(sessions)
                 self.web_view.page().runJavaScript(f'updateSessionsList({sessions_json}); openModal("sessionsModal");')
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
@@ -312,26 +289,24 @@ class SettingsWindow(QWidget):
                 self.web_view.page().runJavaScript(f'showToast("Не удалось загрузить сессии: {safe_error}", true);')
 
         make_server_request_async('get_sessions', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, handle_sessions_response)
 
     def logout_selected_session(self, session_id):
         def handle_logout_response(response):
             if response and response.get('success'):
                 self.web_view.page().runJavaScript('showToast("Сессия завершена");')
-                self.show_sessions_dialog()
+                self.show_sessions_dialog()  # refresh list
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
                 self.web_view.page().runJavaScript(f'showToast("Не удалось завершить сессию: {safe_error}", true);')
 
         make_server_request_async('logout_session', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'target_session_id': session_id,
-            'session_token': self.main_window.session_token
         }, handle_logout_response)
 
     def logout_all_sessions(self):
@@ -345,9 +320,8 @@ class SettingsWindow(QWidget):
                 self.web_view.page().runJavaScript(f'showToast("Не удалось завершить сессии: {safe_error}", true);')
 
         make_server_request_async('logout_all_sessions', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, handle_logout_all_response)
 
     def show_cleanup_dialog(self):
@@ -362,9 +336,8 @@ class SettingsWindow(QWidget):
                     f'showToast("Не удалось загрузить настройки очистки: {safe_error}", true);')
 
         make_server_request_async('get_cleanup_interval', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
+            'session_id': self.session_id,
+            'user_id': self.user_id,
         }, handle_interval_response)
 
     def save_cleanup_settings(self, interval):
@@ -378,10 +351,9 @@ class SettingsWindow(QWidget):
                 self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
 
         make_server_request_async('set_cleanup_interval', {
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
             'interval': interval,
-            'session_token': self.main_window.session_token
         }, handle_save_response)
 
     def show_chat_window(self):
@@ -389,3 +361,9 @@ class SettingsWindow(QWidget):
 
     def logout(self):
         self.main_window.logout()
+
+    def closeEvent(self, event):
+        if self.web_view:
+            self.web_view.stop()
+            self.web_view.setPage(None)
+        super().closeEvent(event)

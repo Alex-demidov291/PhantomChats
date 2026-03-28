@@ -16,8 +16,9 @@ class NetworkManager(QObject):
         self.base_url = f"https://{host}:{port}"
         self.session_token = None
         self.user_token = None
-        self.user_id = None
         self.user_login = None
+        self.session_id = None
+        self.user_id = None
         self.sse_listener = None
         from utils import DATA_PATH
         self.avatars_dir = DATA_PATH / 'avatars'

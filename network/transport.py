@@ -5,14 +5,13 @@ from network.config import SERVER_URL
 
 
 class SSEListener(QObject):
-    # -- слушатель событий от сервера
     message_received = pyqtSignal(dict)
     avatar_updated = pyqtSignal(dict)
     connection_status = pyqtSignal(bool)
 
-    def __init__(self, session_token, user_id, user_login):
+    def __init__(self, session_id, user_id, user_login):
         super().__init__()
-        self.session_token = session_token
+        self.session_id = session_id
         self.user_id = user_id
         self.user_login = user_login
         self.nam = QNetworkAccessManager()
@@ -26,7 +25,7 @@ class SSEListener(QObject):
         request = QNetworkRequest(url)
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "text/event-stream")
         request.setRawHeader(b"X-User-Id", str(self.user_id).encode())
-        request.setRawHeader(b"X-Session-Token", self.session_token.encode())
+        request.setRawHeader(b"X-Session-Id", self.session_id.encode())
         from network.api import messenger_api
         if messenger_api and messenger_api.device_id:
             request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
@@ -77,6 +76,7 @@ class SSEListener(QObject):
 
 class AsyncHTTPRequest(QObject):
     _active_requests = []
+
     def __init__(self, endpoint, data, callback):
         super().__init__()
         self._callback = callback
@@ -92,13 +92,10 @@ class AsyncHTTPRequest(QObject):
         from network.api import messenger_api
         if messenger_api and messenger_api.device_id:
             request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
-        if 'session_token' in data:
-            request.setRawHeader(b"X-Session-Token", str(data.pop('session_token')).encode())
+        if 'session_id' in data:
+            request.setRawHeader(b"X-Session-Id", str(data.pop('session_id')).encode())
         if 'user_id' in data:
             request.setRawHeader(b"X-User-Id", str(data.pop('user_id')).encode())
-        if 'user_token' in data:
-            request.setRawHeader(b"X-User-Token", str(data.pop('user_token')).encode())
-
         body = QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
         self._nam = QNetworkAccessManager()
@@ -127,7 +124,6 @@ class AsyncHTTPRequest(QObject):
 
 
 class SyncHTTPRequest:
-    # -- синхронный https запрос для е2ее
     @staticmethod
     def post(endpoint, data=None):
         url = QUrl(f"{SERVER_URL}/api/{endpoint}")
@@ -137,15 +133,12 @@ class SyncHTTPRequest:
         if messenger_api and messenger_api.device_id:
             request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
         if data:
-            if 'session_token' in data:
-                request.setRawHeader(b"X-Session-Token", str(data['session_token']).encode())
-                del data['session_token']
+            if 'session_id' in data:
+                request.setRawHeader(b"X-Session-Id", str(data['session_id']).encode())
+                del data['session_id']
             if 'user_id' in data:
                 request.setRawHeader(b"X-User-Id", str(data['user_id']).encode())
                 del data['user_id']
-            if 'user_token' in data:
-                request.setRawHeader(b"X-User-Token", str(data['user_token']).encode())
-                del data['user_token']
         json_data = QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8')) if data else QByteArray()
         nam = QNetworkAccessManager()
         reply = nam.post(request, json_data)
