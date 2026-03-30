@@ -1,1 +1,1 @@
-SERVER_URL = "https://phantomchats.ibashlhr.beget.tech"
+SERVER_URL = "https://hell-0.ru:6666"

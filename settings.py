@@ -1,7 +1,7 @@
 import os
 import secrets
 # Client settings
-SERVER_URL = 'https://phantomchats.ibashlhr.beget.tech'
+SERVER_URL = 'https://hell-0.ru:6666'
 
 # Server settings
 RUNNING_PORT = 5000

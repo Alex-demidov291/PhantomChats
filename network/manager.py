@@ -9,7 +9,7 @@ class NetworkManager(QObject):
     connection_status_changed = pyqtSignal(bool)
     avatar_updated = pyqtSignal(dict)
 
-    def __init__(self, host='155.212.145.154', port=5000):
+    def __init__(self, host='155.212.132.185', port=5000):
         super().__init__()
         self.host = host
         self.port = port

@@ -13,7 +13,7 @@ from network.crypto import (
 from network.transport import AsyncHTTPRequest
 
 class MessengerAPI:
-    def __init__(self, host='155.212.145.154', port=5000):
+    def __init__(self, host='155.212.132.185', port=5000):
         self.network_manager = NetworkManager(host, port)
         self.file_cache = None
         self.login_in_progress = False
