@@ -1,10 +1,10 @@
 import os
 import secrets
 # Client settings
-SERVER_URL = 'https://hell-0.ru:6666'
+SERVER_URL = 'https://phant.hell-0.ru/'
 
 # Server settings
-RUNNING_PORT = 5000
+RUNNING_PORT = 6666
 SERVER_HOST = '0.0.0.0'
 
 # Common settings

@@ -20,15 +20,17 @@ catch_all_exceptions()
 
 
 class MainWindow(QMainWindow):
+    # -- главное окно программы
     def __init__(self):
         super().__init__()
         self.cur_widget = None
         self.settings = QSettings("Phantom", "Messenger")
 
         self.current_user = None
-        self.session_id = None
+        self.user_token = None
         self.user_id = None
         self.username = None
+        self.session_token = None
         self.navigation_lock = False
 
         self.show_login_window()
@@ -99,8 +101,9 @@ class MainWindow(QMainWindow):
             self.navigation_lock = False
 
         make_server_request_async('auth', {
-            'session_id': self.session_id,
+            'user_token': self.user_token,
             'user_id': self.user_id,
+            'session_token': self.session_token
         }, handle_auth_response)
 
     def show_settings_window(self):
@@ -128,10 +131,11 @@ class MainWindow(QMainWindow):
         self.navigation_lock = False
 
     def logout(self):
-        if self.session_id and self.user_id:
+        if self.user_token and self.user_id:
             make_server_request_async('logout_current', {
-                'session_id': self.session_id,
+                'user_token': self.user_token,
                 'user_id': self.user_id,
+                'session_token': self.session_token
             }, lambda x: None)
 
         if hasattr(self, 'chat_window') and self.chat_window:
@@ -140,18 +144,20 @@ class MainWindow(QMainWindow):
             shutil.rmtree(DATA_PATH / 'files_cache' / str(self.user_id), ignore_errors=True)
 
         self.current_user = None
-        self.session_id = None
+        self.user_token = None
         self.user_id = None
         self.username = None
+        self.session_token = None
         self.show_login_window()
 
     def closeEvent(self, event):
         self.save_window_state()
-        if self.session_id and self.user_id:
+        if self.user_token and self.user_id:
             from network.transport import SyncHTTPRequest
             SyncHTTPRequest.post('logout_current', {
-                'session_id': self.session_id,
+                'session_token': self.session_token,
                 'user_id': self.user_id,
+                'user_token': self.user_token
             })
         event.accept()
 
@@ -166,7 +172,6 @@ if __name__ == '__main__':
     app.setStyleSheet(style_input_dialog)
     from PyQt6.QtGui import QIcon
     from utils import find_file
-
     icon_path = find_file('images/icon_on_exe.ico')
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))

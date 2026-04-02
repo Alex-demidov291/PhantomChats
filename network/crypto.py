@@ -3,7 +3,6 @@ import json
 import time
 import hashlib
 import hmac
-from PyQt6.QtCore import QObject, pyqtSignal
 import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -46,6 +45,7 @@ def decrypt_master_key(encrypted, password):
     kluch = kdf.derive(password.encode())
     shifr = AESGCM(kluch)
     return shifr.decrypt(nonce, base64.b64decode(encrypted['ciphertext']), None)
+
 
 
 class E2EEMasterKey:
@@ -96,33 +96,15 @@ class E2EEMasterKey:
         return AESGCM(kluch_oborotki).decrypt(nonce, shifrovano, None)
 
 
-class E2EEContactManager(QObject):
-    key_changed = pyqtSignal(str, str, str, object)
-
+class E2EEContactManager:
     def __init__(self, master_key, api):
-        super().__init__()
         self.master_key = master_key
         self.api = api
         self.contact_keys = {}
         self.own_public_key = master_key.get_public_key_bytes()
-        self.pending_confirmations = {}
 
     def get_own_public_key(self):
         return self.own_public_key
-
-    def get_contact_public_key_async(self, contact_login, callback):
-        if contact_login in self.contact_keys:
-            callback(self.contact_keys[contact_login])
-            return
-
-        def handle_response(response):
-            key = self.process_key_response(contact_login, response)
-            callback(key)
-
-        from network.api import make_server_request_async
-        make_server_request_async('get_public_key', {
-            'contact_login': contact_login
-        }, handle_response)
 
     def get_contact_public_key(self, contact_login):
         if contact_login in self.contact_keys:
@@ -142,34 +124,12 @@ class E2EEContactManager(QObject):
 
         if new_format and ed_bytes:
             if not self._verify_ed25519_signature(x_bytes, ed_bytes, response.get('signature', '')):
+                print(f"SECURITY: Ed25519 signature invalid for '{contact_login}' — key rejected")
                 return None
 
-        try:
-            self._tofu_check(contact_login, x_bytes, ed_bytes)
-        except KeyChangedError as e:
-            self.pending_confirmations[contact_login] = {
-                'new_key_bytes': x_bytes,
-                'new_key_b64': e.new_x25519_b64,
-                'old_key_b64': e.old_x25519_b64
-            }
-            self.key_changed.emit(
-                contact_login,
-                e.old_x25519_b64,
-                e.new_x25519_b64,
-                x_bytes
-            )
-            return None
-
         self.contact_keys[contact_login] = x_bytes
+        self._tofu_check(contact_login, x_bytes, ed_bytes)
         return x_bytes
-
-    def confirm_key_change(self, contact_login, accept):
-        if contact_login not in self.pending_confirmations:
-            return
-        pending = self.pending_confirmations.pop(contact_login)
-
-        if accept:
-            self.contact_keys[contact_login] = pending['new_key_bytes']
 
     def publish_own_key(self):
         moy_x = self.own_public_key
@@ -195,16 +155,20 @@ class E2EEContactManager(QObject):
                 if len(x_bytes) == 32 and len(ed_bytes) == 32:
                     return x_bytes, ed_bytes, True
             return None, None, False
+        # старый формат — просто base64 X25519
         raw = base64.b64decode(pub_raw)
         if len(raw) == 32:
             return raw, None, False
         return None, None, False
 
     def _verify_ed25519_signature(self, x_bytes, ed_bytes, sig_b64):
-        podpis = base64.b64decode(sig_b64)
-        pub = Ed25519PublicKey.from_public_bytes(ed_bytes)
-        pub.verify(podpis, x_bytes)
-        return True
+        try:
+            podpis = base64.b64decode(sig_b64)
+            pub = Ed25519PublicKey.from_public_bytes(ed_bytes)
+            pub.verify(podpis, x_bytes)
+            return True
+        except (InvalidSignature, Exception):
+            return False
 
     def _tofu_check(self, contact_login, x_bytes, ed_bytes):
         hranilishe = self._load_trust_store()
@@ -250,8 +214,11 @@ class E2EEContactManager(QObject):
         path = self._get_trust_store_path()
         if not path.exists():
             return {}
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
 
     def _save_trust_store(self, hranilishe):
         path = self._get_trust_store_path()

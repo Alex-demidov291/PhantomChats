@@ -9,16 +9,15 @@ class NetworkManager(QObject):
     connection_status_changed = pyqtSignal(bool)
     avatar_updated = pyqtSignal(dict)
 
-    def __init__(self, host='155.212.132.185', port=5000):
+    def __init__(self, host='155.212.132.185', port=6666):
         super().__init__()
         self.host = host
         self.port = port
         self.base_url = f"https://{host}:{port}"
         self.session_token = None
         self.user_token = None
-        self.user_login = None
-        self.session_id = None
         self.user_id = None
+        self.user_login = None
         self.sse_listener = None
         from utils import DATA_PATH
         self.avatars_dir = DATA_PATH / 'avatars'

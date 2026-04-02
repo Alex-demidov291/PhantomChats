@@ -8,20 +8,25 @@ import html
 from utils import BASE_PATH
 
 class LoginBridge(QObject):
+    # -- мост для входа
+
     def __init__(self, login_window):
         super().__init__()
         self.login_window = login_window
 
     @pyqtSlot(str, str)
     def login(self, login, password):
+        # - вход в систему
         self.login_window.check_log(login, password)
 
     @pyqtSlot()
     def showRegister(self):
+        # - показать регистрацию
         self.login_window.show_register_window()
 
 
 class LoginWindow(QWidget):
+    # -- окно входа
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
@@ -65,11 +70,12 @@ class LoginWindow(QWidget):
         def handle_login_response(response):
             self.web_view.page().runJavaScript('setLoading(false);')
             if response and response.get('success'):
-                self.main_window.session_id = response['session_id']
+                self.main_window.user_token = response['user_token']
                 self.main_window.user_id = response['user_id']
                 self.main_window.username = response['username']
                 self.main_window.current_user = login
-                messenger_api.set_user_credentials(response['session_id'], response['user_id'], login)
+                self.main_window.session_token = response['session_token']
+                messenger_api.set_user_credentials(response['session_token'], response['user_id'], login)
                 e2ee_salt = response.get('e2ee_salt')
                 if e2ee_salt:
                     messenger_api.init_e2ee(password, e2ee_salt)
