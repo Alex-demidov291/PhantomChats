@@ -76,9 +76,6 @@ class LoginWindow(QWidget):
                 self.main_window.current_user = login
                 self.main_window.session_token = response['session_token']
                 messenger_api.set_user_credentials(response['session_token'], response['user_id'], login)
-                e2ee_salt = response.get('e2ee_salt')
-                if e2ee_salt:
-                    messenger_api.init_e2ee(password, e2ee_salt)
                 self.main_window.show_chat_window()
                 self.close()
             else:

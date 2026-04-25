@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import hmac
 import io
+import os
 import json
 import queue
 import secrets
@@ -26,11 +27,28 @@ sqlite3.register_adapter(datetime.datetime, adapt_datetime)
 
 SERVER_HOST = settings.SERVER_HOST
 SERVER_PORT = settings.RUNNING_PORT
-SECRET_KEY = secrets.token_hex(32).encode()
+SESSION_HASH_SALT = settings.SESSION_HASH_SALT
+
+_SECRET_KEY_FILE = "secret_key.bin"
+if os.path.exists(_SECRET_KEY_FILE):
+    with open(_SECRET_KEY_FILE, "rb") as _f:
+        SECRET_KEY = _f.read()
+else:
+    SECRET_KEY = secrets.token_bytes(32)
+    with open(_SECRET_KEY_FILE, "wb") as _f:
+        _f.write(SECRET_KEY)
+
 TOKEN_LIFETIME = 86400
 app = Flask(__name__)
-SERVER_SETUP = opaque_ke_py.server_setup()
-SERVER_SETUP_BYTES = SERVER_SETUP.to_bytes()
+
+_SERVER_SETUP_FILE = "server_setup.bin"
+if os.path.exists(_SERVER_SETUP_FILE):
+    with open(_SERVER_SETUP_FILE, "rb") as _f:
+        SERVER_SETUP_BYTES = _f.read()
+else:
+    SERVER_SETUP_BYTES = opaque_ke_py.server_setup().to_bytes()
+    with open(_SERVER_SETUP_FILE, "wb") as _f:
+        _f.write(SERVER_SETUP_BYTES)
 
 request_log = defaultdict(list)
 request_lock = threading.Lock()
@@ -63,6 +81,7 @@ class Database:
         self.db_path = db_path
         self.init_db()
         self.start_cleanup_thread()
+        self.start_status_cleanup_thread()
 
     def get_connection(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -76,7 +95,6 @@ class Database:
             CREATE TABLE IF NOT EXISTS users (
                 login TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
-                user_token TEXT UNIQUE,
                 user_id INTEGER UNIQUE,
                 avatar_version INTEGER DEFAULT 0,
                 opaque_password_file BLOB NOT NULL,
@@ -199,6 +217,34 @@ class Database:
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS used_nonces (
+                nonce TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                expires_at DATETIME NOT NULL,
+                PRIMARY KEY (nonce, user_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_status (
+                user_id INTEGER PRIMARY KEY,
+                status TEXT DEFAULT 'offline',
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                current_device_id TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS active_connections (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                connected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_online INTEGER DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
         conn.commit()
         conn.close()
 
@@ -207,8 +253,18 @@ class Database:
             while True:
                 time.sleep(300)
                 self.cleanup_expired_sessions()
+                self.cleanup_used_nonces()
 
         thread = threading.Thread(target=cleanup_worker, daemon=True)
+        thread.start()
+
+    def start_status_cleanup_thread(self):
+        def status_cleanup_worker():
+            while True:
+                time.sleep(60)
+                self.cleanup_offline_connections()
+
+        thread = threading.Thread(target=status_cleanup_worker, daemon=True)
         thread.start()
 
     def cleanup_expired_sessions(self):
@@ -231,6 +287,20 @@ class Database:
                     UPDATE user_sessions SET is_active = 0 
                     WHERE user_id = ? AND expires_at < datetime("now")
                 ''', (user_id,))
+        conn.commit()
+        conn.close()
+
+    def cleanup_used_nonces(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM used_nonces WHERE expires_at < datetime('now')")
+        conn.commit()
+        conn.close()
+
+    def cleanup_offline_connections(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM active_connections WHERE last_ping < datetime('now', '-5 minutes')")
         conn.commit()
         conn.close()
 
@@ -290,21 +360,6 @@ class Database:
                 return True, seconds
         return False, 0
 
-    def get_user_by_token(self, session_id, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT u.* FROM users u
-            JOIN user_sessions s ON u.user_id = s.user_id
-            WHERE s.session_id = ? AND u.user_id = ? 
-            AND s.is_active = 1 AND s.expires_at > datetime('now')
-        ''', (session_id, user_id))
-        user = cursor.fetchone()
-        conn.close()
-        if user:
-            return dict(user)
-        return None
-
     def get_user_by_login(self, login):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -314,105 +369,6 @@ class Database:
         if user:
             return dict(user)
         return None
-
-    def create_user_session(self, user_id, user_login, session_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        expires_at = datetime.datetime.now() + datetime.timedelta(seconds=TOKEN_LIFETIME)
-        cursor.execute('''
-            INSERT INTO user_sessions (session_id, user_id, user_login, expires_at)
-            VALUES (?, ?, ?, ?)
-        ''', (session_id, user_id, user_login, expires_at))
-        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
-        cleanup = cursor.fetchone()
-        if cleanup and cleanup[0] == 0:
-            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
-        conn.commit()
-        conn.close()
-        return True
-
-    def deactivate_session(self, session_id, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE user_sessions SET is_active = 0 WHERE session_id = ? AND user_id = ?
-        ''', (session_id, user_id))
-        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
-        cleanup = cursor.fetchone()
-        if cleanup and cleanup[0] == 0:
-            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
-        conn.commit()
-        conn.close()
-        return True
-
-    def deactivate_all_sessions_except(self, user_id, except_session_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE user_sessions SET is_active = 0 
-            WHERE user_id = ? AND session_id != ? AND expires_at > datetime('now')
-        ''', (user_id, except_session_id))
-        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
-        cleanup = cursor.fetchone()
-        if cleanup and cleanup[0] == 0:
-            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
-        conn.commit()
-        conn.close()
-        return True
-
-    def deactivate_all_sessions(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE user_sessions SET is_active = 0 WHERE user_id = ?', (user_id,))
-        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
-        cleanup = cursor.fetchone()
-        if cleanup and cleanup[0] == 0:
-            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
-        conn.commit()
-        conn.close()
-        return True
-
-    def update_session_last_used(self, session_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE user_sessions SET last_used_at = datetime('now') 
-            WHERE session_id = ?
-        ''', (session_id,))
-        conn.commit()
-        conn.close()
-        return True
-
-    def get_user_sessions(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT session_id, created_at, last_used_at, expires_at, is_active
-            FROM user_sessions WHERE user_id = ? ORDER BY last_used_at DESC
-        ''', (user_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else []
-
-    def get_cleanup_interval(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else 0
-
-    def set_cleanup_interval(self, user_id, interval):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO cleanup_settings (user_id, cleanup_interval) VALUES (?, ?)
-        ''', (user_id, interval))
-        if interval == 0:
-            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
-        conn.commit()
-        conn.close()
-        return True
 
     def get_user_avatar_version(self, user_id):
         conn = self.get_connection()
@@ -757,6 +713,185 @@ class Database:
         conn.close()
         return row[0] if row else None
 
+    def get_user_by_session(self, session_id, user_id):
+        hashed = hashlib.sha256((SESSION_HASH_SALT + session_id).encode('utf-8')).hexdigest()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.* FROM users u
+            JOIN user_sessions s ON u.user_id = s.user_id
+            WHERE s.session_id = ? AND u.user_id = ?
+            AND s.is_active = 1 AND s.expires_at > datetime('now')
+        ''', (hashed, user_id))
+        user = cursor.fetchone()
+        conn.close()
+        if user:
+            return dict(user)
+        return None
+
+    def is_session_active(self, session_id, user_id):
+        hashed = hashlib.sha256((SESSION_HASH_SALT + session_id).encode('utf-8')).hexdigest()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 1 FROM user_sessions
+            WHERE session_id = ? AND user_id = ?
+            AND is_active = 1 AND expires_at > datetime('now')
+        ''', (hashed, user_id))
+        result = cursor.fetchone() is not None
+        conn.close()
+        return result
+
+    def create_user_session(self, user_id, user_login, session_id):
+        hashed = hashlib.sha256((SESSION_HASH_SALT + session_id).encode('utf-8')).hexdigest()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM user_sessions WHERE user_id = ? AND is_active = 1', (user_id,))
+        if cursor.fetchone()[0] >= 10:
+            conn.close()
+            return False
+        expires_at = datetime.datetime.now() + datetime.timedelta(seconds=TOKEN_LIFETIME)
+        cursor.execute('''
+            INSERT INTO user_sessions (session_id, user_id, user_login, expires_at)
+            VALUES (?, ?, ?, ?)
+        ''', (hashed, user_id, user_login, expires_at))
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_session(self, session_id, user_id):
+        hashed = hashlib.sha256((SESSION_HASH_SALT + session_id).encode('utf-8')).hexdigest()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE user_sessions SET is_active = 0 WHERE session_id = ? AND user_id = ?
+        ''', (hashed, user_id))
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_all_sessions_except(self, user_id, except_session_id):
+        hashed_except = hashlib.sha256((SESSION_HASH_SALT + except_session_id).encode('utf-8')).hexdigest()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE user_sessions SET is_active = 0
+            WHERE user_id = ? AND session_id != ? AND expires_at > datetime('now')
+        ''', (user_id, hashed_except))
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_all_sessions(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE user_sessions SET is_active = 0 WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def update_session_last_used(self, session_id):
+        hashed = hashlib.sha256((SESSION_HASH_SALT + session_id).encode('utf-8')).hexdigest()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE user_sessions SET last_used_at = datetime('now')
+            WHERE session_id = ?
+        ''', (hashed,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def update_connection_ping(self, session_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE active_connections SET last_ping = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (session_id,))
+        conn.commit()
+        conn.close()
+
+    def get_user_sessions(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT session_id, created_at, last_used_at, expires_at, is_active
+            FROM user_sessions WHERE user_id = ? ORDER BY last_used_at DESC
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
+
+    def get_cleanup_interval(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else 0
+
+    def set_cleanup_interval(self, user_id, interval):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO cleanup_settings (user_id, cleanup_interval) VALUES (?, ?)
+        ''', (user_id, interval))
+        if interval == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def deactivate_session_by_hash(self, hashed_session_id, user_id):
+        """Деактивирует сессию по уже хэшированному session_id (из get_user_sessions)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE user_sessions SET is_active = 0 WHERE session_id = ? AND user_id = ?',
+            (hashed_session_id, user_id)
+        )
+        cursor.execute('SELECT cleanup_interval FROM cleanup_settings WHERE user_id = ?', (user_id,))
+        cleanup = cursor.fetchone()
+        if cleanup and cleanup[0] == 0:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ? AND is_active = 0', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def mark_nonce_used(self, nonce, user_id):
+        """Записывает nonce в таблицу. Возвращает False если nonce уже был использован (replay)."""
+        expires_at = datetime.datetime.now() + datetime.timedelta(hours=72)
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO used_nonces (nonce, user_id, expires_at) VALUES (?, ?, ?)",
+                (nonce, user_id, expires_at)
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.IntegrityError:
+            conn.close()
+            return False
+
 
 db = Database()
 
@@ -802,25 +937,32 @@ def remove_event_queue(user_id):
 
 def login_required(f):
     def decorated(*args, **kwargs):
-        data = request.get_json(silent=True) or {}
         session_token = request.headers.get('X-Session-Token')
-        user_id = request.headers.get('X-User-Id')
         user_token = request.headers.get('X-User-Token')
-        if not session_token and not user_token:
+        user_id_str = request.headers.get('X-User-Id')
+        if not user_id_str:
             return jsonify({'success': False, 'error': 'Missing credentials'}), 401
-        if session_token and user_id:
+        try:
+            user_id = int(user_id_str)
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Invalid user ID'}), 401
+
+        session_id = None
+        if session_token:
             session_id = verify_session_token(session_token, user_id)
-            if session_id:
-                user = db.get_user_by_token(session_id, user_id)
-                if user:
-                    db.update_session_last_used(session_id)
-                    return f(user, data, *args, **kwargs)
-        elif user_token and user_id:
-            user = db.get_user_by_token(user_token, user_id)
-            if user:
-                db.update_session_last_used(user_token)
-                return f(user, data, *args, **kwargs)
-        return jsonify({'success': False, 'error': 'Неверный токен или ID пользователя'}), 401
+        if not session_id and user_token:
+            session_id = user_token
+
+        if not session_id:
+            return jsonify({'success': False, 'error': 'Missing credentials'}), 401
+
+        user = db.get_user_by_session(session_id, user_id)
+        if not user:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+        db.update_session_last_used(session_id)
+        db.update_connection_ping(session_id)
+        data = request.get_json(silent=True) or {}
+        return f(user, data, *args, **kwargs)
 
     decorated.__name__ = f.__name__
     return decorated
@@ -1096,8 +1238,15 @@ def info(user, data):
 @login_required
 def get_sessions(user, data):
     sessions = db.get_user_sessions(user['user_id'])
-    current_session = request.headers.get('X-User-Token') or verify_session_token(
-        request.headers.get('X-Session-Token'), user['user_id']) if request.headers.get('X-Session-Token') else None
+    raw_session = None
+    if request.headers.get('X-Session-Token'):
+        raw_session = verify_session_token(request.headers.get('X-Session-Token'), user['user_id'])
+    if not raw_session:
+        raw_session = request.headers.get('X-User-Token')
+    current_hashed = (
+        hashlib.sha256((SESSION_HASH_SALT + raw_session).encode('utf-8')).hexdigest()
+        if raw_session else None
+    )
     formatted = []
     for s in sessions:
         expires_at = datetime.datetime.fromisoformat(s['expires_at'])
@@ -1109,7 +1258,7 @@ def get_sessions(user, data):
             'expires_at': s['expires_at'],
             'expires_in': int(expires_in),
             'is_active': bool(s['is_active']),
-            'is_current': s['session_id'] == current_session
+            'is_current': s['session_id'] == current_hashed
         })
     return jsonify({'success': True, 'sessions': formatted})
 
@@ -1121,7 +1270,8 @@ def logout_session(user, data):
     target = data.get('target_session_id')
     if not target:
         return jsonify({'success': False, 'error': 'Не указана сессия'})
-    db.deactivate_session(target, user['user_id'])
+    # target — уже хэшированный session_id из get_sessions, не хэшируем повторно
+    db.deactivate_session_by_hash(target, user['user_id'])
     return jsonify({'success': True})
 
 
@@ -1350,6 +1500,9 @@ def send_message(user, data):
         return jsonify({'success': False, 'error': 'Не указан получатель'})
     if not text and not file_id:
         return jsonify({'success': False, 'error': 'Пустое сообщение'})
+
+    if nonce and not db.mark_nonce_used(nonce, user['user_id']):
+        return jsonify({'success': False, 'error': 'Дублирующееся сообщение отклонено'}), 409
 
     receiver_user = db.get_user_by_login(receiver)
     if not receiver_user:
@@ -1602,13 +1755,20 @@ def events():
         return jsonify({'success': False, 'error': 'Device ID required'}), 400
     if not session_token and not user_token:
         return jsonify({'success': False, 'error': 'Missing credentials'}), 401
-    if session_token and user_id:
-        session_id = verify_session_token(session_token, user_id)
+    try:
+        uid_int = int(user_id) if user_id else None
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid user ID'}), 401
+    if not uid_int:
+        return jsonify({'success': False, 'error': 'Missing user ID'}), 401
+
+    if session_token:
+        session_id = verify_session_token(session_token, uid_int)
         if not session_id:
             return jsonify({'success': False, 'error': 'Invalid token'}), 401
-        user = db.get_user_by_token(session_id, user_id)
-    elif user_token and user_id:
-        user = db.get_user_by_token(user_token, user_id)
+        user = db.get_user_by_session(session_id, uid_int)
+    elif user_token:
+        user = db.get_user_by_session(user_token, uid_int)
     else:
         return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
     if not user:
