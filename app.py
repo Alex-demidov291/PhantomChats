@@ -860,7 +860,6 @@ class Database:
         return True
 
     def deactivate_session_by_hash(self, hashed_session_id, user_id):
-        """Деактивирует сессию по уже хэшированному session_id (из get_user_sessions)."""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -876,7 +875,6 @@ class Database:
         return True
 
     def mark_nonce_used(self, nonce, user_id):
-        """Записывает nonce в таблицу. Возвращает False если nonce уже был использован (replay)."""
         expires_at = datetime.datetime.now() + datetime.timedelta(hours=72)
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1270,7 +1268,6 @@ def logout_session(user, data):
     target = data.get('target_session_id')
     if not target:
         return jsonify({'success': False, 'error': 'Не указана сессия'})
-    # target — уже хэшированный session_id из get_sessions, не хэшируем повторно
     db.deactivate_session_by_hash(target, user['user_id'])
     return jsonify({'success': True})
 
