@@ -396,10 +396,6 @@ class MessengerAPI:
                                                                    credential_response)
             credential_finalization = client_login_finish.get_message()
         except Exception as e:
-            self.login_in_progress = False
-            self.network_manager.stop_event_listener()
-            callback({'success': False, 'error': 'Неверный логин или пароль'})
-
             def handle_failed_response(failed_response):
                 self.login_in_progress = False
                 self.network_manager.stop_event_listener()

@@ -7,6 +7,7 @@ from network import messenger_api
 import html
 from utils import BASE_PATH
 
+
 class LoginBridge(QObject):
     # -- мост для входа
 

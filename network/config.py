@@ -1,1 +1,1 @@
-SERVER_URL = "https://phant.hell-0.ru/"
+SERVER_URL = "https://test.hell-0.ru/"
