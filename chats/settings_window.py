@@ -85,8 +85,19 @@ class SettingsWindow(QWidget):
         self.main_window = main_window
         self.cur_ava_path = defult_ava
         self.bridge = SettingsBridge(self)
+        self._destroyed = False
         self.init_ui()
         self.script_dir = Path(__file__).parent.parent
+
+    def _safe_run_js(self, js_code):
+        """Безопасный вызов JavaScript, если web_view ещё существует."""
+        if self._destroyed:
+            return
+        try:
+            page = self.web_view.page()
+            page.runJavaScript(js_code)
+        except RuntimeError:
+            self._destroyed = True
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -130,7 +141,7 @@ class SettingsWindow(QWidget):
             with open(default_avatar_path, 'rb') as f:
                 default_avatar_data = f.read()
                 default_avatar_base64 = base64.b64encode(default_avatar_data).decode('utf-8')
-                self.web_view.page().runJavaScript(f'setDefaultAvatarFromBase64("{default_avatar_base64}");')
+                self._safe_run_js(f'setDefaultAvatarFromBase64("{default_avatar_base64}");')
 
         def handle_info_response(response):
             if response and response.get('success'):
@@ -138,13 +149,13 @@ class SettingsWindow(QWidget):
                 username = response.get('username', '')
                 avatar_version = response.get('avatar_version', 0)
 
-                self.web_view.page().runJavaScript(f'setUsername("{username}");')
+                self._safe_run_js(f'setUsername("{username}");')
 
                 if messenger_api.network_manager.has_avatar_cached(user_id, avatar_version):
                     avatar_data = messenger_api.network_manager.get_avatar_from_cache(user_id, avatar_version)
                     if avatar_data:
                         avatar_base64 = base64.b64encode(avatar_data).decode('utf-8')
-                        self.web_view.page().runJavaScript(f'updateAvatar("{avatar_base64}");')
+                        self._safe_run_js(f'updateAvatar("{avatar_base64}");')
                         return
 
                 def handle_avatar_response(avatar_response):
@@ -153,11 +164,11 @@ class SettingsWindow(QWidget):
                         if avatar_data:
                             avatar_bytes = base64.b64decode(avatar_data)
                             messenger_api.network_manager.save_avatar_to_cache(user_id, avatar_version, avatar_bytes)
-                            self.web_view.page().runJavaScript(f'updateAvatar("{avatar_data}");')
+                            self._safe_run_js(f'updateAvatar("{avatar_data}");')
                         else:
-                            self.web_view.page().runJavaScript('showDefaultAvatar();')
+                            self._safe_run_js('showDefaultAvatar();')
                     else:
-                        self.web_view.page().runJavaScript('showDefaultAvatar();')
+                        self._safe_run_js('showDefaultAvatar();')
 
                 make_server_request_async('get_avatar', {
                     'user_token': self.main_window.user_token,
@@ -174,18 +185,18 @@ class SettingsWindow(QWidget):
 
     def change_name(self, new_name):
         if len(new_name) < 4 or len(new_name) > 20:
-            self.web_view.page().runJavaScript(
+            self._safe_run_js(
                 'showToast("Имя должно содержать минимум 4, максимум 20 символов!", true);')
             return
 
         def handle_change_name_response(response):
             if response and response.get('success'):
                 self.main_window.username = new_name
-                self.web_view.page().runJavaScript('showToast("Имя успешно изменено!");')
+                self._safe_run_js('showToast("Имя успешно изменено!");')
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
         make_server_request_async('update_profile', {
             'user_token': self.main_window.user_token,
@@ -203,14 +214,14 @@ class SettingsWindow(QWidget):
             with open(fname, 'rb') as f:
                 image_data = f.read()
             if len(image_data) > 150 * 1024:
-                self.web_view.page().runJavaScript('showToast("Изображение слишком большое (максимум 150KB)!", true);')
+                self._safe_run_js('showToast("Изображение слишком большое (максимум 150KB)!", true);')
                 return
 
             from PIL import Image
             import io
             img = Image.open(io.BytesIO(image_data))
             if img.width > 8000 or img.height > 5000:
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     'showToast("Изображение слишком большое (максимум 8000x5000)!", true);')
                 return
 
@@ -229,12 +240,12 @@ class SettingsWindow(QWidget):
                             messenger_api.network_manager.remove_old_avatar(
                                 self.main_window.user_id, avatar_version - 1
                             )
-                        self.web_view.page().runJavaScript(f'updateAvatar("{avatar_data}");')
-                    self.web_view.page().runJavaScript('showToast("Аватар успешно изменен!");')
+                        self._safe_run_js(f'updateAvatar("{avatar_data}");')
+                    self._safe_run_js('showToast("Аватар успешно изменен!");')
                 else:
                     error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                     safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                    self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                    self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
             make_server_request_async('update_profile', {
                 'user_token': self.main_window.user_token,
@@ -245,15 +256,15 @@ class SettingsWindow(QWidget):
 
     def change_password(self, new_password, confirm_password):
         if not new_password or not confirm_password:
-            self.web_view.page().runJavaScript('showToast("Заполните все поля!", true);')
+            self._safe_run_js('showToast("Заполните все поля!", true);')
             return
 
         if new_password != confirm_password:
-            self.web_view.page().runJavaScript('showToast("Пароли не совпадают!", true);')
+            self._safe_run_js('showToast("Пароли не совпадают!", true);')
             return
 
         if len(new_password) < 8 or len(new_password) > 25:
-            self.web_view.page().runJavaScript(
+            self._safe_run_js(
                 'showToast("Пароль должен содержать минимум 8, максимум 25 символов!", true);')
             return
 
@@ -273,20 +284,20 @@ class SettingsWindow(QWidget):
                 has_special = True
 
         if not (number_for_pass and zagl_for_pass and low_for_pass and has_special):
-            self.web_view.page().runJavaScript(
+            self._safe_run_js(
                 'showToast("Пароль должен содержать маленькие и заглавные английские буквы, цифры или спец символы", true);')
             return
 
         def handle_change_password_response(response):
             if response and response.get('success'):
-                self.web_view.page().runJavaScript('clearPasswordFields();')
-                self.web_view.page().runJavaScript(
+                self._safe_run_js('clearPasswordFields();')
+                self._safe_run_js(
                     'showToast("Пароль успешно изменен! Все остальные сессии завершены.");')
-                self.web_view.page().runJavaScript('closeAllModals();')
+                self._safe_run_js('closeAllModals();')
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
         messenger_api.opaque_change_password_async(new_password, handle_change_password_response)
 
@@ -305,11 +316,11 @@ class SettingsWindow(QWidget):
                         'is_current': s.get('is_current', False)
                     })
                 sessions_json = json.dumps(formatted_sessions)
-                self.web_view.page().runJavaScript(f'updateSessionsList({sessions_json}); openModal("sessionsModal");')
+                self._safe_run_js(f'updateSessionsList({sessions_json}); openModal("sessionsModal");')
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Не удалось загрузить сессии: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Не удалось загрузить сессии: {safe_error}", true);')
 
         make_server_request_async('get_sessions', {
             'user_token': self.main_window.user_token,
@@ -320,12 +331,12 @@ class SettingsWindow(QWidget):
     def logout_selected_session(self, session_id):
         def handle_logout_response(response):
             if response and response.get('success'):
-                self.web_view.page().runJavaScript('showToast("Сессия завершена");')
+                self._safe_run_js('showToast("Сессия завершена");')
                 self.show_sessions_dialog()
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Не удалось завершить сессию: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Не удалось завершить сессию: {safe_error}", true);')
 
         make_server_request_async('logout_session', {
             'user_token': self.main_window.user_token,
@@ -337,12 +348,12 @@ class SettingsWindow(QWidget):
     def logout_all_sessions(self):
         def handle_logout_all_response(response):
             if response and response.get('success'):
-                self.web_view.page().runJavaScript('showToast("Все другие сессии завершены");')
+                self._safe_run_js('showToast("Все другие сессии завершены");')
                 self.show_sessions_dialog()
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Не удалось завершить сессии: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Не удалось завершить сессии: {safe_error}", true);')
 
         make_server_request_async('logout_all_sessions', {
             'user_token': self.main_window.user_token,
@@ -354,11 +365,11 @@ class SettingsWindow(QWidget):
         def handle_interval_response(response):
             if response and response.get('success'):
                 interval = response.get('cleanup_interval', 0)
-                self.web_view.page().runJavaScript(f'setCleanupInterval({interval}); openModal("cleanupModal");')
+                self._safe_run_js(f'setCleanupInterval({interval}); openModal("cleanupModal");')
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     f'showToast("Не удалось загрузить настройки очистки: {safe_error}", true);')
 
         make_server_request_async('get_cleanup_interval', {
@@ -370,12 +381,12 @@ class SettingsWindow(QWidget):
     def save_cleanup_settings(self, interval):
         def handle_save_response(response):
             if response and response.get('success'):
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     'showToast("Настройки очистки сохранены"); closeModal("cleanupModal");')
             else:
                 error_msg = response.get('error', 'Неизвестная ошибка') if response else 'Ошибка соединения'
                 safe_error = html.escape(error_msg).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
         make_server_request_async('set_cleanup_interval', {
             'user_token': self.main_window.user_token,
@@ -389,3 +400,7 @@ class SettingsWindow(QWidget):
 
     def logout(self):
         self.main_window.logout()
+
+    def closeEvent(self, event):
+        self._destroyed = True
+        super().closeEvent(event)

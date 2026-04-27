@@ -162,6 +162,7 @@ class ChatWindow(QWidget):
         self.e2ee_ready = False
         self.pending_contact_load = None
         self.settings_retry_count = 0
+        self._destroyed = False
 
         self.avatar_timer = QTimer()
         self.avatar_timer.timeout.connect(self.check_avatar_updates)
@@ -178,6 +179,16 @@ class ChatWindow(QWidget):
         self.setup_msg_listener()
         self.avatar_timer.start()
         self.sync_timer.start()
+
+    def _safe_run_js(self, js_code):
+        """Безопасный вызов JavaScript, если web_view ещё существует."""
+        if self._destroyed:
+            return
+        try:
+            page = self.web_view.page()
+            page.runJavaScript(js_code)
+        except RuntimeError:
+            self._destroyed = True
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -231,14 +242,21 @@ class ChatWindow(QWidget):
     def load_user_data(self):
         if not self.page_loaded:
             return
-        self.web_view.page().runJavaScript(f'setCurrentUser("{self.main_window.current_user}");')
+        self._safe_run_js(f'setCurrentUser("{self.main_window.current_user}");')
 
     def fetch_contact_pubkey(self, contact):
         if not messenger_api.e2ee_contact_manager:
             return
-        kluch = messenger_api.e2ee_contact_manager.get_contact_public_key(contact.login)
-        if kluch:
-            contact.public_key = kluch
+        try:
+            kluch = messenger_api.e2ee_contact_manager.get_contact_public_key(contact.login)
+            if kluch:
+                contact.public_key = kluch
+        except KeyChangedError as e:
+            contact.public_key = e.new_key_bytes
+            safe_login = html.escape(contact.login).replace('"', '\\"')
+            self._safe_run_js(
+                f'showToast("⚠ Ключ {safe_login} изменился. Проверьте безопасность.", true);'
+            )
 
     def _prefetch_key_then(self, contact, callback):
         if not messenger_api.e2ee_contact_manager:
@@ -259,7 +277,7 @@ class ChatWindow(QWidget):
                 except KeyChangedError as e:
                     contact.public_key = e.new_key_bytes
                     safe_login = html.escape(contact.login).replace('"', '\\"')
-                    self.web_view.page().runJavaScript(
+                    self._safe_run_js(
                         f'showToast("⚠ Ключ {safe_login} изменился. Проверьте безопасность.", true);'
                     )
             callback()
@@ -292,6 +310,8 @@ class ChatWindow(QWidget):
         try:
             msg['message_text'] = messenger_api.e2ee_message_handler.decrypt_message(
                 data['data'], contact_login)
+        except KeyChangedError:
+            msg['message_text'] = '[Ключ контакта изменился. Обновите чат.]'
         except Exception:
             msg['message_text'] = '[Ошибка расшифровки]'
 
@@ -353,7 +373,7 @@ class ChatWindow(QWidget):
             self._load_messages_after_contact(kontakt)
         else:
             oshibka = otvet.get('error', 'Контакт не найден') if otvet else 'Ошибка соединения'
-            self.web_view.page().runJavaScript(f'showToast("{oshibka}", true);')
+            self._safe_run_js(f'showToast("{oshibka}", true);')
 
     def _load_messages_after_contact(self, contact):
         if self.pending_contact_load != contact.login:
@@ -381,7 +401,7 @@ class ChatWindow(QWidget):
             self._process_e2ee_msg(msg, login_dlya_decrypt)
             obrabotannyye.append(self.prepare_msg_for_display(msg))
 
-        self.web_view.page().runJavaScript(f'setMessages({json.dumps(obrabotannyye)});')
+        self._safe_run_js(f'setMessages({json.dumps(obrabotannyye)});')
         self.ensure_msg_previews(aktualnyy.user_id, soobshenia)
         self.sync_contact_msgs(aktualnyy)
 
@@ -397,16 +417,16 @@ class ChatWindow(QWidget):
                     kontakt = self.contacts.get(receiver_login)
                     if kontakt:
                         self.msg_cache.append_messages(kontakt.user_id, [otpravlennoe])
-                    self.web_view.page().runJavaScript(
+                    self._safe_run_js(
                         f'appendMessage({json.dumps(self.prepare_msg_for_display(otpravlennoe))});')
-                    self.web_view.page().runJavaScript(
+                    self._safe_run_js(
                         'document.getElementById("messageInput").value = "";')
                     if kontakt:
                         self.ensure_msg_previews(kontakt.user_id, [otpravlennoe])
             else:
                 oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
         try:
             handle_send_otvet(messenger_api.send_message(
@@ -418,7 +438,7 @@ class ChatWindow(QWidget):
             ))
         except KeyChangedError:
             safe_login = html.escape(receiver_login).replace('"', '\\"')
-            self.web_view.page().runJavaScript(
+            self._safe_run_js(
                 f'showToast("Ключ {safe_login} изменился. Проверьте безопасность.", true);')
             handle_send_otvet(messenger_api.send_message(
                 token=self.main_window.user_token,
@@ -430,7 +450,7 @@ class ChatWindow(QWidget):
 
     def attach_file(self, params_json):
         if not self.cur_contact:
-            self.web_view.page().runJavaScript('showToast("Сначала выберите контакт", true);')
+            self._safe_run_js('showToast("Сначала выберите контакт", true);')
             return
 
         params = json.loads(params_json)
@@ -448,7 +468,7 @@ class ChatWindow(QWidget):
             return
 
         if os.path.getsize(put_fayla) > 10 * 1024 * 1024:
-            self.web_view.page().runJavaScript('showToast("Файл слишком большой (максимум 10MB)", true);')
+            self._safe_run_js('showToast("Файл слишком большой (максимум 10MB)", true);')
             return
 
         imya_fayla = os.path.basename(put_fayla)
@@ -456,19 +476,19 @@ class ChatWindow(QWidget):
         if not tip_fayla:
             tip_fayla = "application/octet-stream"
 
-        self.web_view.page().runJavaScript('showProgress(0);')
+        self._safe_run_js('showProgress(0);')
         with open(put_fayla, 'rb') as f:
             dannyye = f.read()
 
         def handle_upload_otvet(otvet):
-            self.web_view.page().runJavaScript('showProgress(100);')
+            self._safe_run_js('showProgress(100);')
             if otvet and otvet.get('success'):
                 self._send_msg_with_file(otvet.get('file_id'), tekst_vvoda,
                                          imya_fayla, tip_fayla, tolko_kartinka)
             else:
                 oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
         payload = {
             'user_token': self.main_window.user_token,
@@ -504,15 +524,15 @@ class ChatWindow(QWidget):
                 if otpravlennoe:
                     otpravlennoe['decrypted_text'] = polnyy_tekst
                     self.msg_cache.append_messages(self.cur_contact.user_id, [otpravlennoe])
-                    self.web_view.page().runJavaScript(
+                    self._safe_run_js(
                         f'appendMessage({json.dumps(self.prepare_msg_for_display(otpravlennoe))});')
-                    self.web_view.page().runJavaScript(
+                    self._safe_run_js(
                         'document.getElementById("messageInput").value = "";')
                     self.ensure_msg_previews(self.cur_contact.user_id, [otpravlennoe])
             else:
                 oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
         handle_send_otvet(messenger_api.send_message(
             token=self.main_window.user_token,
@@ -529,16 +549,16 @@ class ChatWindow(QWidget):
                 self.save_file_dialog(file_info['name'], dannyye)
                 return
 
-        self.web_view.page().runJavaScript('showProgress(0);')
+        self._safe_run_js('showProgress(0);')
 
         def handle_file_otvet(otvet):
-            self.web_view.page().runJavaScript('showProgress(100);')
+            self._safe_run_js('showProgress(100);')
             if otvet and otvet.get('success'):
                 raw = base64.b64decode(otvet.get('file_data'))
                 dannyye = self._decrypt_file_bytes(raw, file_info,
                                                    sender_login=file_info.get('sender_login'))
                 if dannyye is None:
-                    self.web_view.page().runJavaScript('showToast("Ошибка расшифровки файла", true);')
+                    self._safe_run_js('showToast("Ошибка расшифровки файла", true);')
                     return
                 self.save_file_dialog(file_info['name'], dannyye)
                 if messenger_api.file_cache:
@@ -547,7 +567,7 @@ class ChatWindow(QWidget):
             else:
                 oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     f'showToast("Не удалось загрузить файл: {safe_error}", true);')
 
         make_server_request_async('get_file', {
@@ -574,9 +594,9 @@ class ChatWindow(QWidget):
         if put_sohraneniya:
             with open(put_sohraneniya, 'wb') as f:
                 f.write(dannyye)
-            self.web_view.page().runJavaScript('showToast("Файл сохранен");')
+            self._safe_run_js('showToast("Файл сохранен");')
         else:
-            self.web_view.page().runJavaScript('showToast("Сохранение отменено");')
+            self._safe_run_js('showToast("Сохранение отменено");')
 
     def save_fullscreen_image(self, image_data, file_name):
         from PyQt6.QtCore import QCoreApplication
@@ -592,17 +612,17 @@ class ChatWindow(QWidget):
         if put_sohraneniya:
             with open(put_sohraneniya, 'wb') as f:
                 f.write(bayty)
-            self.web_view.page().runJavaScript('showToast("Изображение сохранено");')
+            self._safe_run_js('showToast("Изображение сохранено");')
 
     def add_contact(self, contact_login):
         if not contact_login:
-            self.web_view.page().runJavaScript('showToast("Введите логин пользователя!", true);')
+            self._safe_run_js('showToast("Введите логин пользователя!", true);')
             return
         if contact_login == self.main_window.current_user:
-            self.web_view.page().runJavaScript('showToast("Нельзя добавить самого себя!", true);')
+            self._safe_run_js('showToast("Нельзя добавить самого себя!", true);')
             return
         if contact_login in self.contacts:
-            self.web_view.page().runJavaScript('showToast("Этот пользователь уже в контактах!", true);')
+            self._safe_run_js('showToast("Этот пользователь уже в контактах!", true);')
             return
         make_server_request_async('add_contact', {
             'user_token': self.main_window.user_token,
@@ -622,7 +642,7 @@ class ChatWindow(QWidget):
         else:
             oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
             safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-            self.web_view.page().runJavaScript(f'showToast("Ошибка: {safe_error}", true);')
+            self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
     def _handle_add_contact_info(self, contact_login, otvet):
         if otvet and otvet.get('success'):
@@ -635,10 +655,10 @@ class ChatWindow(QWidget):
                 if messenger_api.e2ee_contact_manager:
                     self.fetch_contact_pubkey(novyy)
                 self._update_contacts_js()
-                self.web_view.page().runJavaScript('showToast("Контакт добавлен!");')
+                self._safe_run_js('showToast("Контакт добавлен!");')
                 self.load_contact_settings()
         else:
-            self.web_view.page().runJavaScript('showToast("Пользователь не найден!", true);')
+            self._safe_run_js('showToast("Пользователь не найден!", true);')
 
     def delete_chat(self, contact_login):
         make_server_request_async('remove_contact', {
@@ -655,14 +675,14 @@ class ChatWindow(QWidget):
             self._update_contacts_js()
             if self.cur_contact and self.cur_contact.login == contact_login:
                 self.cur_contact = None
-                self.web_view.page().runJavaScript('showWelcomeScreen();')
-            self.web_view.page().runJavaScript('showToast("Чат удален!");')
+                self._safe_run_js('showWelcomeScreen();')
+            self._safe_run_js('showToast("Чат удален!");')
 
     def rename_contact(self, contact_login, new_name):
         if not new_name:
             return
         if len(new_name) > 64:
-            self.web_view.page().runJavaScript('showToast("Имя не может быть длиннее 64 символов", true);')
+            self._safe_run_js('showToast("Имя не может быть длиннее 64 символов", true);')
             return
         make_server_request_async('save_contact_settings', {
             'user_token': self.main_window.user_token,
@@ -680,9 +700,9 @@ class ChatWindow(QWidget):
             if self.cur_contact and self.cur_contact.login == contact_login:
                 self.cur_contact.display_name = new_name
                 safe_name = html.escape(new_name).replace('"', '\\"').replace("'", "\\'")
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     f'document.getElementById("chatName").textContent = "{safe_name}";')
-            self.web_view.page().runJavaScript('showToast("Контакт переименован!");')
+            self._safe_run_js('showToast("Контакт переименован!");')
 
     def show_settings(self):
         self.main_window.show_settings_window()
@@ -704,7 +724,7 @@ class ChatWindow(QWidget):
         self.msg_cache.append_messages(kontakt.user_id, [message_data])
 
         if self.cur_contact and self.cur_contact.user_id == kontakt.user_id:
-            self.web_view.page().runJavaScript(
+            self._safe_run_js(
                 f'appendMessage({json.dumps(self.prepare_msg_for_display(kopiya))});')
             self.ensure_msg_previews(kontakt.user_id, [message_data])
 
@@ -827,7 +847,7 @@ class ChatWindow(QWidget):
                                       if otpravitel == self.main_window.current_user
                                       else otpravitel)
                 self._process_e2ee_msg(kopiya, login_dlya_decrypt)
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     f'appendMessage({json.dumps(self.prepare_msg_for_display(kopiya))});')
             self.ensure_msg_previews(contact.user_id, dobavlennyye)
 
@@ -869,7 +889,7 @@ class ChatWindow(QWidget):
                             dannyye, prevyu)
                     if prevyu:
                         prevyu_b64 = base64.b64encode(prevyu).decode('utf-8')
-                        self.web_view.page().runJavaScript(
+                        self._safe_run_js(
                             f'updateMessageThumbnail({message_id}, "{prevyu_b64}");')
                     break
 
@@ -937,7 +957,7 @@ class ChatWindow(QWidget):
                     if novoe_imya:
                         self.cur_contact.display_name = novoe_imya
                         safe_name = html.escape(novoe_imya).replace('"', '\\"').replace("'", "\\'")
-                        self.web_view.page().runJavaScript(
+                        self._safe_run_js(
                             f'document.getElementById("chatName").textContent = "{safe_name}";')
             self._save_settings_cache()
             self.settings_retry_count = 0
@@ -956,7 +976,7 @@ class ChatWindow(QWidget):
         if obnovleno:
             self._update_contacts_js()
             if self.cur_contact and self.cur_contact.login in kesh:
-                self.web_view.page().runJavaScript(
+                self._safe_run_js(
                     f'document.getElementById("chatName").textContent = '
                     f'"{html.escape(kesh[self.cur_contact.login])}";')
 
@@ -1046,7 +1066,7 @@ class ChatWindow(QWidget):
             }
             for c in self.contacts.values()
         ]
-        self.web_view.page().runJavaScript(f'setContacts({json.dumps(spisok)});')
+        self._safe_run_js(f'setContacts({json.dumps(spisok)});')
         self.contacts_need_update = False
 
     def _update_avatar_in_js(self, login):
@@ -1054,7 +1074,7 @@ class ChatWindow(QWidget):
             return
         dannyye = self._get_avatar_data(login)
         if dannyye:
-            self.web_view.page().runJavaScript(f'updateContactAvatar("{login}", "{dannyye}");')
+            self._safe_run_js(f'updateContactAvatar("{login}", "{dannyye}");')
 
     def _get_avatar_data(self, login):
         pixmap = self.contact_avatars.get(login)
@@ -1078,6 +1098,7 @@ class ChatWindow(QWidget):
         return 'data:image/png;base64,' + byte_array.toBase64().data().decode()
 
     def closeEvent(self, event):
+        self._destroyed = True
         self.avatar_timer.stop()
         self.sync_timer.stop()
         super().closeEvent(event)

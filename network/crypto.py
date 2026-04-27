@@ -127,8 +127,16 @@ class E2EEContactManager:
                 print(f"SECURITY: Ed25519 signature invalid for '{contact_login}' — key rejected")
                 return None
 
+        # Сохраняем ключ и проверяем TOFU
+        try:
+            self._tofu_check(contact_login, x_bytes, ed_bytes)
+        except KeyChangedError as e:
+            # Ключ изменился — обновляем и продолжаем с новым ключом
+            print(f"Key change detected for '{contact_login}': updating to new key")
+            self.contact_keys[contact_login] = x_bytes
+            raise  # Пробрасываем исключение дальше для обработки на уровне UI
+
         self.contact_keys[contact_login] = x_bytes
-        self._tofu_check(contact_login, x_bytes, ed_bytes)
         return x_bytes
 
     def publish_own_key(self):
@@ -188,6 +196,7 @@ class E2EEContactManager:
         zapis = hranilishe[contact_login]
         if zapis['x25519'] != kluch_b64:
             staryy = zapis['x25519']
+            # Обновляем хранилище перед тем как бросить исключение
             hranilishe[contact_login] = {
                 'x25519': kluch_b64,
                 'ed25519': ed_b64,
