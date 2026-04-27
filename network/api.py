@@ -405,7 +405,13 @@ class MessengerAPI:
             # with 401 because we have no session token yet — they're
             # redone at login time, when credentials are present.)
             self.user_login = login
-            self.init_e2ee(master_key)
+            try:
+                self.init_e2ee(master_key)
+            except Exception as exc:
+                # Don't strand the UI in a loading state if a publish
+                # endpoint is missing/misbehaving — registration itself
+                # already succeeded server-side.
+                print(f'init_e2ee failed during register: {exc}')
             callback(response)
         else:
             callback(response)
@@ -454,9 +460,14 @@ class MessengerAPI:
             self.set_user_credentials(response['session_token'], user_id, login)
             encrypted_master_key_str = response.get('encrypted_master_key')
             if encrypted_master_key_str:
-                encrypted = json.loads(encrypted_master_key_str)
-                master_key = decrypt_master_key(encrypted, password)
-                self.init_e2ee(master_key)
+                try:
+                    encrypted = json.loads(encrypted_master_key_str)
+                    master_key = decrypt_master_key(encrypted, password)
+                    self.init_e2ee(master_key)
+                except Exception as exc:
+                    # Do NOT propagate — UI must always get the callback,
+                    # otherwise the loading spinner becomes terminal.
+                    print(f'init_e2ee failed during login: {exc}')
             self.network_manager.start_event_listener()
             self.login_in_progress = False
             callback(response)

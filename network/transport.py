@@ -112,10 +112,20 @@ class AsyncHTTPRequest(QObject):
                 result = {'success': False, 'error': self._reply.errorString()}
             else:
                 status = self._reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-                raw = self._reply.readAll().data()
-                result = json.loads(raw)
-                if status and status != 200:
-                    result = {'success': False, 'error': result.get('error', f'HTTP {status}')}
+                raw = bytes(self._reply.readAll().data())
+                if not raw:
+                    result = {'success': False,
+                              'error': f'empty response (HTTP {status})'}
+                else:
+                    try:
+                        result = json.loads(raw)
+                    except (ValueError, json.JSONDecodeError):
+                        snippet = raw[:120].decode('utf-8', errors='replace')
+                        result = {'success': False,
+                                  'error': f'non-JSON response (HTTP {status}): {snippet}'}
+                if status and status != 200 and isinstance(result, dict):
+                    result = {'success': False,
+                              'error': result.get('error', f'HTTP {status}')}
         except Exception as e:
             result = {'success': False, 'error': str(e)}
         finally:
@@ -123,45 +133,80 @@ class AsyncHTTPRequest(QObject):
             if self in AsyncHTTPRequest._active_requests:
                 AsyncHTTPRequest._active_requests.remove(self)
 
-        self._callback(result)
+        # Last-resort wrap so a buggy callback never freezes the UI in a
+        # half-finished state — the user has at least *something* in hand.
+        try:
+            self._callback(result)
+        except Exception as cb_exc:
+            try:
+                self._callback({'success': False,
+                                'error': f'callback failed: {cb_exc}'})
+            except Exception:
+                pass
 
 
 class SyncHTTPRequest:
     # -- синхронный https запрос для е2ее
     @staticmethod
     def post(endpoint, data=None):
-        url = QUrl(f"{SERVER_URL}/api/{endpoint}")
-        request = QNetworkRequest(url)
-        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
-        from network.api import messenger_api
-        if messenger_api and messenger_api.device_id:
-            request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
-        if data:
-            if 'session_token' in data:
-                request.setRawHeader(b"X-Session-Token", str(data['session_token']).encode())
-                del data['session_token']
-            if 'user_id' in data:
-                request.setRawHeader(b"X-User-Id", str(data['user_id']).encode())
-                del data['user_id']
-            if 'user_token' in data:
-                request.setRawHeader(b"X-User-Token", str(data['user_token']).encode())
-                del data['user_token']
-        json_data = QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8')) if data else QByteArray()
-        nam = QNetworkAccessManager()
-        reply = nam.post(request, json_data)
-        loop = QEventLoop()
-        reply.finished.connect(loop.quit)
-        loop.exec()
+        try:
+            url = QUrl(f"{SERVER_URL}/api/{endpoint}")
+            request = QNetworkRequest(url)
+            request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+            from network.api import messenger_api
+            if messenger_api and messenger_api.device_id:
+                request.setRawHeader(b"X-Device-ID", messenger_api.device_id.encode())
+            if data:
+                if 'session_token' in data:
+                    request.setRawHeader(b"X-Session-Token", str(data['session_token']).encode())
+                    del data['session_token']
+                if 'user_id' in data:
+                    request.setRawHeader(b"X-User-Id", str(data['user_id']).encode())
+                    del data['user_id']
+                if 'user_token' in data:
+                    request.setRawHeader(b"X-User-Token", str(data['user_token']).encode())
+                    del data['user_token']
+            json_data = (QByteArray(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+                         if data else QByteArray())
+            nam = QNetworkAccessManager()
+            reply = nam.post(request, json_data)
+            loop = QEventLoop()
+            reply.finished.connect(loop.quit)
+            loop.exec()
 
-        status_code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        if status_code and status_code != 200:
-            response_data = reply.readAll().data()
-            json_response = json.loads(response_data)
-            error_msg = json_response.get('error', f'HTTPS ошибка {status_code}')
-            return {'success': False, 'error': error_msg}
+            status_code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            response_data = bytes(reply.readAll().data())
+            net_err = reply.error()
 
-        if reply.error() != QNetworkReply.NetworkError.NoError:
-            return {'success': False, 'error': reply.errorString()}
+            if net_err != QNetworkReply.NetworkError.NoError:
+                return {'success': False,
+                        'error': reply.errorString() or 'network error',
+                        'status': status_code}
 
-        response_data = reply.readAll().data()
-        return json.loads(response_data)
+            # Empty body — common when an endpoint hasn't been deployed yet
+            # or returns 204. Don't try to json.loads "" — it raises and
+            # would deadlock callers waiting on a callback.
+            if not response_data:
+                return {'success': False,
+                        'error': f'empty response (HTTP {status_code})',
+                        'status': status_code}
+
+            try:
+                parsed = json.loads(response_data)
+            except (ValueError, json.JSONDecodeError):
+                snippet = response_data[:120].decode('utf-8', errors='replace')
+                return {'success': False,
+                        'error': f'non-JSON response (HTTP {status_code}): {snippet}',
+                        'status': status_code}
+
+            if status_code and status_code != 200:
+                if isinstance(parsed, dict) and 'error' in parsed:
+                    return {'success': False, 'error': parsed['error'],
+                            'status': status_code}
+                return {'success': False,
+                        'error': f'HTTPS ошибка {status_code}',
+                        'status': status_code}
+
+            return parsed
+        except Exception as exc:  # last-resort: never propagate
+            return {'success': False, 'error': f'sync request failed: {exc}'}
