@@ -1,15 +1,21 @@
+import hashlib
 import json
 import os
 import base64
 from datetime import datetime, timezone
 from PyQt6.QtCore import QSettings
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import opaque_ke_py
 from network.manager import NetworkManager
 from network.cache import FileCache
 from network.crypto import (
-    E2EEMasterKey, E2EEContactManager, E2EEMessageHandler,
-    gen_msg_master_key, encrypt_master_key, decrypt_master_key
+    gen_msg_master_key, encrypt_master_key, decrypt_master_key,
 )
+from network.cryptolib import (
+    IdentityKeys, PreKeyStore, SessionManager,
+    UnknownInitialMessage, SessionError,
+)
+from network.cryptolib.prekeys import OPK_REFILL_THRESHOLD, DEFAULT_OPK_BATCH
 from network.transport import AsyncHTTPRequest
 
 
@@ -21,9 +27,10 @@ class MessengerAPI:
         self.login_in_progress = False
         self.device_id = None
         self.user_login = None
-        self.e2ee_master_key = None
-        self.e2ee_contact_manager = None
-        self.e2ee_message_handler = None
+        self.master_key_bytes = None
+        self.identity = None
+        self.prekey_store = None
+        self.session_manager = None
         self.encrypted_master_key = None
 
     def init_device_id(self):
@@ -63,15 +70,77 @@ class MessengerAPI:
         return response
 
     def init_e2ee(self, master_key):
-        self.e2ee_master_key = E2EEMasterKey(master_key)
-        self.e2ee_contact_manager = E2EEContactManager(self.e2ee_master_key, self)
-        self.e2ee_message_handler = E2EEMessageHandler(self.e2ee_master_key, self.e2ee_contact_manager)
-        self.e2ee_contact_manager.publish_own_key()
+        self.master_key_bytes = bytes(master_key)
+        self.identity = IdentityKeys.from_master_key(self.master_key_bytes)
+
+        stored = SessionManager.load_prekey_store_dict(
+            self.user_login or 'unknown', self.master_key_bytes,
+        )
+        if stored is not None:
+            self.prekey_store = PreKeyStore.from_dict(stored)
+        else:
+            self.prekey_store = PreKeyStore()
+
+        self.session_manager = SessionManager(
+            own_login=self.user_login or 'unknown',
+            identity_keys=self.identity,
+            prekey_store=self.prekey_store,
+            master_key=self.master_key_bytes,
+            bundle_fetcher=self._fetch_prekey_bundle,
+        )
+
+        self._publish_identity_bundle()
+        self._ensure_signed_prekey_published()
+        self._maybe_refill_one_time_prekeys()
+
+        self.session_manager.save_prekey_store()
+
+    def _publish_identity_bundle(self):
+        bundle = json.dumps({
+            'x25519': base64.b64encode(self.identity.ik_pub_bytes).decode(),
+            'ed25519': base64.b64encode(self.identity.sik_pub_bytes).decode(),
+        }, separators=(',', ':'))
+        signature = base64.b64encode(self.identity.sign_identity_binding()).decode()
+        self.network_manager.send_sync_request('publish_public_key', {
+            'public_key': bundle,
+            'signature': signature,
+        })
+
+    def _ensure_signed_prekey_published(self):
+        spk = self.prekey_store.ensure_signed_prekey(self.identity)
+        self.network_manager.send_sync_request('upload_signed_prekey', {
+            'spk_id': spk.key_id,
+            'public_key': base64.b64encode(spk.pub_bytes).decode(),
+            'signature': base64.b64encode(spk.signature).decode(),
+        })
+
+    def _maybe_refill_one_time_prekeys(self):
+        resp = self.network_manager.send_sync_request('get_one_time_prekey_count', {})
+        remote = (resp or {}).get('count', 0) if isinstance(resp, dict) else 0
+        if remote >= OPK_REFILL_THRESHOLD:
+            return
+        new_keys = self.prekey_store.generate_one_time_prekeys(DEFAULT_OPK_BATCH)
+        payload = [
+            {'opk_id': k.key_id,
+             'public_key': base64.b64encode(k.pub_bytes).decode()}
+            for k in new_keys
+        ]
+        self.network_manager.send_sync_request('upload_one_time_prekeys', {
+            'prekeys': payload,
+        })
+
+    def _fetch_prekey_bundle(self, contact_login):
+        resp = self.network_manager.send_sync_request('get_prekey_bundle', {
+            'contact_login': contact_login,
+        })
+        if not resp or not resp.get('success'):
+            return None
+        return resp.get('bundle')
 
     def send_message(self, token, user_id, receiver_login, text='', file_id=None):
-        if self.e2ee_message_handler and text:
-            encrypted = self.e2ee_message_handler.encrypt_message(text, receiver_login)
-            text = json.dumps({'type': 'e2ee', 'data': encrypted})
+        if self.session_manager and text:
+            wire = self.session_manager.encrypt_for(receiver_login, text)
+            text = json.dumps(wire, separators=(',', ':'))
         client_timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
         nonce = os.urandom(8).hex()
         data = {
@@ -144,56 +213,29 @@ class MessengerAPI:
             data['session_token'] = self.network_manager.session_token
         return self.network_manager.send_sync_request('set_cleanup_interval', data)
 
-    def _encrypt_file_key(self, file_key):
-        if not self.e2ee_master_key:
-            raise Exception("E2EE не инициализирован")
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        nonce = os.urandom(12)
-        aesgcm = AESGCM(self.e2ee_master_key.encryption_key)
-        cipher = aesgcm.encrypt(nonce, file_key, None)
-        combined = nonce + cipher
-        return base64.b64encode(combined).decode('utf-8')
-
-    def _decrypt_file_key(self, encrypted_key):
-        if not self.e2ee_master_key:
-            raise Exception("E2EE не инициализирован")
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        combined = base64.b64decode(encrypted_key)
-        nonce = combined[:12]
-        cipher = combined[12:]
-        aesgcm = AESGCM(self.e2ee_master_key.encryption_key)
-        return aesgcm.decrypt(nonce, cipher, None)
-
     def encrypt_file_data(self, file_data, thumbnail_data, receiver_login=None):
-        if not self.e2ee_master_key:
-            raise Exception("E2EE не инициализирован")
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        file_key = os.urandom(32)
+        if not self.session_manager:
+            raise SessionError('Session manager not initialised')
+        if not receiver_login:
+            raise SessionError('receiver_login required for file encryption')
 
+        file_key = os.urandom(32)
         nonce_file = os.urandom(12)
         aesgcm = AESGCM(file_key)
         ciphertext = aesgcm.encrypt(nonce_file, file_data, None)
 
-        encrypted_key_sender = self._encrypt_file_key(file_key)
-        encrypted_key_receiver = None
-        if receiver_login and self.e2ee_contact_manager:
-            receiver_pub = self.e2ee_contact_manager.contact_keys.get(receiver_login)
-            if receiver_pub:
-                try:
-                    encrypted_key_receiver = self.e2ee_master_key.encrypt_file_key_for_recipient(
-                        file_key, receiver_pub
-                    )
-                except Exception as e:
-                    print(f"File key ECDH encrypt error: {e}")
+        wrapper = json.dumps({
+            'k': base64.b64encode(file_key).decode(),
+            'n': base64.b64encode(nonce_file).decode(),
+            'h': hashlib.sha256(file_data).hexdigest(),
+        }, separators=(',', ':')).encode('utf-8')
 
-        key_bundle = {'s': encrypted_key_sender}
-        if encrypted_key_receiver:
-            key_bundle['r'] = encrypted_key_receiver
+        wire = self.session_manager.encrypt_for(receiver_login, wrapper)
 
         result = {
             'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
             'nonce_file': base64.b64encode(nonce_file).decode('utf-8'),
-            'encrypted_key': json.dumps(key_bundle),
+            'encrypted_key': json.dumps(wire, separators=(',', ':')),
         }
 
         if thumbnail_data:
@@ -204,34 +246,21 @@ class MessengerAPI:
 
         return result
 
-    def _resolve_file_key(self, encrypted_key_str, sender_login=None):
-        if not self.e2ee_master_key:
-            raise Exception("E2EE не инициализирован")
-
-        try:
-            bundle = json.loads(encrypted_key_str)
-            if isinstance(bundle, dict):
-                if 's' in bundle:
-                    try:
-                        return self._decrypt_file_key(bundle['s'])
-                    except Exception:
-                        pass
-
-                if 'r' in bundle and sender_login and self.e2ee_contact_manager:
-                    sender_pub = self.e2ee_contact_manager.contact_keys.get(sender_login)
-                    if sender_pub:
-                        return self.e2ee_master_key.decrypt_file_key_from_sender(
-                            bundle['r'], sender_pub
-                        )
-        except (json.JSONDecodeError, Exception):
-            pass
-        return self._decrypt_file_key(encrypted_key_str)
-
     def decrypt_file_data(self, ciphertext, nonce, encrypted_key, sender_login=None):
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        file_key = self._resolve_file_key(encrypted_key, sender_login)
-        aesgcm = AESGCM(file_key)
-        return aesgcm.decrypt(nonce, ciphertext, None)
+        if not self.session_manager:
+            raise SessionError('Session manager not initialised')
+        if not sender_login:
+            raise SessionError('sender_login required for file decryption')
+
+        wire = json.loads(encrypted_key)
+        wrapper_bytes = self.session_manager.decrypt_from(sender_login, wire)
+        wrapper = json.loads(wrapper_bytes.decode('utf-8'))
+        file_key = base64.b64decode(wrapper['k'])
+        plaintext = AESGCM(file_key).decrypt(nonce, ciphertext, None)
+        # Integrity check via end-to-end SHA-256.
+        if hashlib.sha256(plaintext).hexdigest() != wrapper.get('h'):
+            raise SessionError('file integrity check failed')
+        return plaintext
 
     def upload_file(self, token, user_id, file_data, file_name, file_type,
                     is_image_only=False, encrypted_key=None, nonce_file=None,
@@ -370,6 +399,12 @@ class MessengerAPI:
     def _handle_register_upload(self, login, username, password, master_key, callback, response):
         if response and response.get('success'):
             user_id = response['user_id']
+            # Stamp the login *before* init_e2ee so the prekey store is
+            # saved under DATA_PATH/crypto/<login>/ instead of /unknown/.
+            # (The server-publish calls inside init_e2ee will still fail
+            # with 401 because we have no session token yet — they're
+            # redone at login time, when credentials are present.)
+            self.user_login = login
             self.init_e2ee(master_key)
             callback(response)
         else:
@@ -454,7 +489,7 @@ class MessengerAPI:
                                                                     server_response)
         registration_upload = client_reg_finish.get_message()
 
-        master_key = self.e2ee_master_key.master_key
+        master_key = self.master_key_bytes
         encrypted_new = encrypt_master_key(master_key, new_password)
         encrypted_master_key_new = json.dumps(encrypted_new)
 
@@ -470,7 +505,7 @@ class MessengerAPI:
             callback(response)
 
     def opaque_change_password_async(self, new_password, callback):
-        if not self.e2ee_master_key:
+        if not self.master_key_bytes:
             callback({'success': False, 'error': 'E2EE не инициализирован'})
             return
 

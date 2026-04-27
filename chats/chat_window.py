@@ -20,6 +20,7 @@ from PyQt6.QtCore import QByteArray, QBuffer
 from utils import BASE_PATH
 from network import make_server_request_async, messenger_api, Contact
 from network.crypto import KeyChangedError
+from network.cryptolib import UnknownInitialMessage, SessionError
 import markdown
 import base64
 import html
@@ -70,6 +71,10 @@ class Bridge(QObject):
     @pyqtSlot(str, str)
     def saveFullscreenImage(self, image_data, file_name):
         self.chat_window.save_fullscreen_image(image_data, file_name)
+
+    @pyqtSlot(str)
+    def verifyContact(self, contact_login):
+        self.chat_window.show_safety_number(contact_login)
 
 
 class MessageCache:
@@ -181,7 +186,6 @@ class ChatWindow(QWidget):
         self.sync_timer.start()
 
     def _safe_run_js(self, js_code):
-        """Безопасный вызов JavaScript, если web_view ещё существует."""
         if self._destroyed:
             return
         try:
@@ -245,49 +249,35 @@ class ChatWindow(QWidget):
         self._safe_run_js(f'setCurrentUser("{self.main_window.current_user}");')
 
     def fetch_contact_pubkey(self, contact):
-        if not messenger_api.e2ee_contact_manager:
+        return
+
+    def show_safety_number(self, contact_login):
+        from chats.safety_dialog import SafetyNumberDialog
+        if not messenger_api.session_manager:
+            self._safe_run_js('showToast("E2EE не инициализирован", true);')
             return
-        try:
-            kluch = messenger_api.e2ee_contact_manager.get_contact_public_key(contact.login)
-            if kluch:
-                contact.public_key = kluch
-        except KeyChangedError as e:
-            contact.public_key = e.new_key_bytes
-            safe_login = html.escape(contact.login).replace('"', '\\"')
-            self._safe_run_js(
-                f'showToast("⚠ Ключ {safe_login} изменился. Проверьте безопасность.", true);'
-            )
+        peer = messenger_api.session_manager.peer_identity(contact_login)
+        if peer is None:
+            bundle = messenger_api._fetch_prekey_bundle(contact_login)
+            if not bundle:
+                self._safe_run_js('showToast("Не удалось получить ключи контакта", true);')
+                return
+            try:
+                peer_ik = base64.b64decode(bundle['ik'])
+            except (KeyError, ValueError):
+                self._safe_run_js('showToast("Битый bundle контакта", true);')
+                return
+        else:
+            peer_ik, _peer_sik = peer
+
+        own_ik = messenger_api.identity.ik_pub_bytes
+        own_login = messenger_api.user_login or self.main_window.current_user
+        dlg = SafetyNumberDialog(own_login, contact_login, own_ik, peer_ik,
+                                 parent=self)
+        dlg.exec()
 
     def _prefetch_key_then(self, contact, callback):
-        if not messenger_api.e2ee_contact_manager:
-            callback()
-            return
-
-        if contact.login in messenger_api.e2ee_contact_manager.contact_keys:
-            contact.public_key = messenger_api.e2ee_contact_manager.contact_keys[contact.login]
-            callback()
-            return
-
-        def handle_key_otvet(otvet):
-            if otvet and otvet.get('success'):
-                try:
-                    kluch = messenger_api.e2ee_contact_manager.process_key_response(contact.login, otvet)
-                    if kluch:
-                        contact.public_key = kluch
-                except KeyChangedError as e:
-                    contact.public_key = e.new_key_bytes
-                    safe_login = html.escape(contact.login).replace('"', '\\"')
-                    self._safe_run_js(
-                        f'showToast("⚠ Ключ {safe_login} изменился. Проверьте безопасность.", true);'
-                    )
-            callback()
-
-        make_server_request_async('get_public_key', {
-            'contact_login': contact.login,
-            'user_token': self.main_window.user_token,
-            'user_id': self.main_window.user_id,
-            'session_token': self.main_window.session_token
-        }, handle_key_otvet)
+        callback()
 
     def _process_e2ee_msg(self, msg, contact_login):
         if 'decrypted_text' in msg:
@@ -299,19 +289,26 @@ class ChatWindow(QWidget):
         if not tekst.strip().startswith('{'):
             return
 
-        data = json.loads(tekst)
-        if not isinstance(data, dict) or data.get('type') != 'e2ee':
+        try:
+            data = json.loads(tekst)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        if data.get('type') not in ('x3dh-init', 'ratchet'):
             return
 
-        if not messenger_api.e2ee_message_handler:
+        if not messenger_api.session_manager:
             msg['message_text'] = '[E2EE не инициализирован]'
             return
 
         try:
-            msg['message_text'] = messenger_api.e2ee_message_handler.decrypt_message(
-                data['data'], contact_login)
-        except KeyChangedError:
-            msg['message_text'] = '[Ключ контакта изменился. Обновите чат.]'
+            plaintext = messenger_api.session_manager.decrypt_from(contact_login, data)
+            msg['message_text'] = plaintext.decode('utf-8', errors='replace')
+        except UnknownInitialMessage:
+            msg['message_text'] = '[Сессия не установлена. Попросите собеседника написать первым.]'
+        except SessionError:
+            msg['message_text'] = '[Ошибка сессии]'
         except Exception:
             msg['message_text'] = '[Ошибка расшифровки]'
 
@@ -320,7 +317,7 @@ class ChatWindow(QWidget):
             return raw_bytes
         encrypted_key = file_info.get('encrypted_key')
         nonce_file = file_info.get('nonce_file')
-        if not encrypted_key or not nonce_file or not messenger_api.e2ee_master_key:
+        if not encrypted_key or not nonce_file or not messenger_api.session_manager:
             return None
         try:
             nonce_bytes = base64.b64decode(nonce_file)
@@ -330,15 +327,7 @@ class ChatWindow(QWidget):
             return None
 
     def _ensure_sender_key_cached(self, sender_login):
-        if not sender_login or not messenger_api.e2ee_contact_manager:
-            return
-        if sender_login in messenger_api.e2ee_contact_manager.contact_keys:
-            return
-        if sender_login == self.main_window.current_user:
-            return
-        kontakt = self.contacts.get(sender_login)
-        if kontakt and kontakt.public_key:
-            messenger_api.e2ee_contact_manager.contact_keys[sender_login] = kontakt.public_key
+        return
 
     def load_messages(self, contact_login):
         self.pending_contact_load = contact_login
@@ -368,7 +357,7 @@ class ChatWindow(QWidget):
             if not sushchestvuyushchiy:
                 self.contacts[contact_login] = kontakt
             self.load_contact_avatar(kontakt)
-            if messenger_api.e2ee_contact_manager:
+            if messenger_api.session_manager:
                 self.fetch_contact_pubkey(kontakt)
             self._load_messages_after_contact(kontakt)
         else:
@@ -379,7 +368,7 @@ class ChatWindow(QWidget):
         if self.pending_contact_load != contact.login:
             return
         self.cur_contact = contact
-        if messenger_api.e2ee_contact_manager:
+        if messenger_api.session_manager:
             self._prefetch_key_then(contact, lambda: self._render_messages(contact))
         else:
             self._render_messages(contact)
@@ -436,17 +425,9 @@ class ChatWindow(QWidget):
                 text=text,
                 file_id=None
             ))
-        except KeyChangedError:
-            safe_login = html.escape(receiver_login).replace('"', '\\"')
-            self._safe_run_js(
-                f'showToast("Ключ {safe_login} изменился. Проверьте безопасность.", true);')
-            handle_send_otvet(messenger_api.send_message(
-                token=self.main_window.user_token,
-                user_id=self.main_window.user_id,
-                receiver_login=receiver_login,
-                text=text,
-                file_id=None
-            ))
+        except SessionError as exc:
+            safe = html.escape(str(exc)).replace('"', '\\"').replace("'", "\\'")
+            self._safe_run_js(f'showToast("E2EE: {safe}", true);')
 
     def attach_file(self, params_json):
         if not self.cur_contact:
@@ -476,6 +457,10 @@ class ChatWindow(QWidget):
         if not tip_fayla:
             tip_fayla = "application/octet-stream"
 
+        if tip_fayla.lower().startswith('video/') and os.path.getsize(put_fayla) > 1024 * 1024:
+            self._safe_run_js('showToast("Видео не должно превышать 1 MB", true);')
+            return
+
         self._safe_run_js('showProgress(0);')
         with open(put_fayla, 'rb') as f:
             dannyye = f.read()
@@ -500,16 +485,18 @@ class ChatWindow(QWidget):
         }
 
         login_poluchatelya = self.cur_contact.login
-        pub_poluchatelya = (messenger_api.e2ee_contact_manager.contact_keys.get(login_poluchatelya)
-                            if messenger_api.e2ee_master_key and messenger_api.e2ee_contact_manager
-                            else None)
-
-        if pub_poluchatelya:
-            enc = messenger_api.encrypt_file_data(dannyye, None, receiver_login=login_poluchatelya)
-            payload['file_data'] = enc['ciphertext']
-            payload['encrypted_key'] = enc['encrypted_key']
-            payload['nonce_file'] = enc['nonce_file']
-            payload['is_encrypted'] = 1
+        if messenger_api.session_manager:
+            try:
+                enc = messenger_api.encrypt_file_data(dannyye, None,
+                                                      receiver_login=login_poluchatelya)
+                payload['file_data'] = enc['ciphertext']
+                payload['encrypted_key'] = enc['encrypted_key']
+                payload['nonce_file'] = enc['nonce_file']
+                payload['is_encrypted'] = 1
+            except SessionError as exc:
+                safe = html.escape(str(exc)).replace('"', '\\"').replace("'", "\\'")
+                self._safe_run_js(f'showToast("E2EE: {safe}", true);')
+                return
         else:
             payload['file_data'] = base64.b64encode(dannyye).decode('utf-8')
 
@@ -652,7 +639,7 @@ class ChatWindow(QWidget):
                                 user_id=u['user_id'], avatar_version=u.get('avatar_version', 0))
                 self.contacts[contact_login] = novyy
                 self.load_contact_avatar(novyy)
-                if messenger_api.e2ee_contact_manager:
+                if messenger_api.session_manager:
                     self.fetch_contact_pubkey(novyy)
                 self._update_contacts_js()
                 self._safe_run_js('showToast("Контакт добавлен!");')

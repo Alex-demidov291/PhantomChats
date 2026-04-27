@@ -218,6 +218,28 @@ class Database:
             )
         ''')
         cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_signed_prekeys (
+                user_id INTEGER PRIMARY KEY,
+                spk_id INTEGER NOT NULL,
+                public_key TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_one_time_prekeys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                opk_id INTEGER NOT NULL,
+                public_key TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, opk_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_opk_user ON user_one_time_prekeys (user_id)')
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS used_nonces (
                 nonce TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -680,6 +702,84 @@ class Database:
         conn.commit()
         conn.close()
         return True
+
+    def save_signed_prekey(self, user_id, spk_id, public_key, signature):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_signed_prekeys
+                (user_id, spk_id, public_key, signature, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+        ''', (user_id, spk_id, public_key, signature))
+        conn.commit()
+        conn.close()
+        return True
+
+    def get_signed_prekey(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT spk_id, public_key, signature FROM user_signed_prekeys WHERE user_id = ?',
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {'spk_id': row[0], 'public_key': row[1], 'signature': row[2]}
+        return None
+
+    def save_one_time_prekeys(self, user_id, prekeys):
+        if not prekeys:
+            return 0
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        inserted = 0
+        for opk_id, pub in prekeys:
+            try:
+                cursor.execute('''
+                    INSERT INTO user_one_time_prekeys (user_id, opk_id, public_key)
+                    VALUES (?, ?, ?)
+                ''', (user_id, opk_id, pub))
+                inserted += 1
+            except sqlite3.IntegrityError:
+                continue
+        conn.commit()
+        conn.close()
+        return inserted
+
+    def take_one_time_prekey(self, user_id):
+        conn = self.get_connection()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, opk_id, public_key
+                FROM user_one_time_prekeys
+                WHERE user_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+            ''', (user_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            row_id, opk_id, pub = row[0], row[1], row[2]
+            cursor.execute('DELETE FROM user_one_time_prekeys WHERE id = ?', (row_id,))
+            conn.commit()
+            return {'opk_id': opk_id, 'public_key': pub}
+        finally:
+            conn.close()
+
+    def count_one_time_prekeys(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT COUNT(*) FROM user_one_time_prekeys WHERE user_id = ?',
+            (user_id,),
+        )
+        n = cursor.fetchone()[0]
+        conn.close()
+        return n
 
     def get_user_e2ee_salt(self, user_id):
         conn = self.get_connection()
@@ -1362,6 +1462,10 @@ def opaque_login_failed():
     return jsonify({'success': True})
 
 
+MAX_VIDEO_BYTES = 1024 * 1024  # 1 MB cap for encrypted video uploads
+MAX_FILE_BYTES = 25 * 1024 * 1024  # general per-file cap
+
+
 @app.route('/api/upload_file', methods=['POST'])
 @rate_limit
 @login_required
@@ -1380,6 +1484,11 @@ def upload_file(user, data):
         return jsonify({'success': False, 'error': 'Missing file data'})
 
     file_bytes = base64.b64decode(file_data)
+    if len(file_bytes) > MAX_FILE_BYTES:
+        return jsonify({'success': False, 'error': 'File too large'}), 413
+    if isinstance(file_type, str) and file_type.lower().startswith('video/') \
+            and len(file_bytes) > MAX_VIDEO_BYTES:
+        return jsonify({'success': False, 'error': 'Video must be 1 MB or smaller'}), 413
     thumb_bytes = base64.b64decode(thumbnail) if thumbnail else None
     success, result = db.save_file(
         file_bytes, file_name, file_type, user['login'],
@@ -1739,6 +1848,99 @@ def get_public_key(user, data):
         return jsonify({'success': True, 'public_key': key_data['public_key'], 'signature': key_data['signature']})
     else:
         return jsonify({'success': False, 'error': 'Public key not found'})
+
+
+@app.route('/api/upload_signed_prekey', methods=['POST'])
+@rate_limit
+@login_required
+def upload_signed_prekey(user, data):
+    spk_id = data.get('spk_id')
+    public_key = data.get('public_key')
+    signature = data.get('signature')
+    if spk_id is None or not public_key or not signature:
+        return jsonify({'success': False, 'error': 'Missing fields'})
+    try:
+        spk_id = int(spk_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Invalid spk_id'})
+    db.save_signed_prekey(user['user_id'], spk_id, public_key, signature)
+    return jsonify({'success': True})
+
+
+@app.route('/api/upload_one_time_prekeys', methods=['POST'])
+@rate_limit
+@login_required
+def upload_one_time_prekeys(user, data):
+    keys = data.get('prekeys')
+    if not isinstance(keys, list) or not keys:
+        return jsonify({'success': False, 'error': 'prekeys must be a non-empty list'})
+    if len(keys) > 200:
+        return jsonify({'success': False, 'error': 'Too many prekeys in single batch'})
+    pairs = []
+    for entry in keys:
+        if not isinstance(entry, dict):
+            return jsonify({'success': False, 'error': 'Invalid prekey entry'})
+        opk_id = entry.get('opk_id')
+        pub = entry.get('public_key')
+        if opk_id is None or not pub:
+            return jsonify({'success': False, 'error': 'Missing opk_id or public_key'})
+        try:
+            opk_id_int = int(opk_id)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Invalid opk_id'})
+        pairs.append((opk_id_int, pub))
+    inserted = db.save_one_time_prekeys(user['user_id'], pairs)
+    return jsonify({'success': True, 'inserted': inserted,
+                    'total': db.count_one_time_prekeys(user['user_id'])})
+
+
+@app.route('/api/get_one_time_prekey_count', methods=['POST'])
+@rate_limit
+@login_required
+def get_one_time_prekey_count(user, data):
+    return jsonify({'success': True,
+                    'count': db.count_one_time_prekeys(user['user_id'])})
+
+
+@app.route('/api/get_prekey_bundle', methods=['POST'])
+@rate_limit
+@login_required
+def get_prekey_bundle(user, data):
+    contact_login = data.get('contact_login')
+    if not contact_login:
+        return jsonify({'success': False, 'error': 'Missing contact_login'})
+    contact = db.get_user_by_login(contact_login)
+    if not contact:
+        return jsonify({'success': False, 'error': 'Contact not found'})
+
+    identity = db.get_user_public_key(contact['user_id'])
+    if not identity:
+        return jsonify({'success': False, 'error': 'Identity key not published'})
+
+    spk = db.get_signed_prekey(contact['user_id'])
+    if not spk:
+        return jsonify({'success': False, 'error': 'Signed prekey not published'})
+
+    try:
+        identity_bundle = json.loads(identity['public_key'])
+        ik_b64 = identity_bundle['x25519']
+        sik_b64 = identity_bundle['ed25519']
+    except (KeyError, ValueError):
+        return jsonify({'success': False, 'error': 'Identity key bundle malformed'})
+
+    opk_row = db.take_one_time_prekey(contact['user_id'])
+
+    bundle = {
+        'ik': ik_b64,
+        'sik': sik_b64,
+        'identity_signature': identity['signature'],
+        'spk_id': spk['spk_id'],
+        'spk': spk['public_key'],
+        'spk_signature': spk['signature'],
+        'opk_id': opk_row['opk_id'] if opk_row else None,
+        'opk': opk_row['public_key'] if opk_row else None,
+    }
+    return jsonify({'success': True, 'bundle': bundle})
 
 
 @app.route('/api/events')
