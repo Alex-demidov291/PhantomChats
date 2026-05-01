@@ -91,6 +91,16 @@ class Database:
     def init_db(self):
         conn = self.get_connection()
         cursor = conn.cursor()
+        cursor.executescript('''
+            DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS files;
+            DROP TABLE IF EXISTS user_signed_prekeys;
+            DROP TABLE IF EXISTS user_one_time_prekeys;
+            DROP TABLE IF EXISTS devices;
+            DROP TABLE IF EXISTS device_signed_prekeys;
+            DROP TABLE IF EXISTS device_one_time_prekeys;
+            DROP TABLE IF EXISTS archive;
+        ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 login TEXT PRIMARY KEY,
@@ -104,39 +114,89 @@ class Database:
             )
         ''')
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender_login TEXT NOT NULL,
-                receiver_login TEXT NOT NULL,
-                message_text TEXT NOT NULL,
-                has_file INTEGER DEFAULT 0,
-                file_id INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                client_timestamp TEXT,
-                nonce TEXT,
-                FOREIGN KEY (sender_login) REFERENCES users (login),
-                FOREIGN KEY (receiver_login) REFERENCES users (login),
-                FOREIGN KEY (file_id) REFERENCES files(id)
+            CREATE TABLE devices (
+                user_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                device_label TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, device_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         ''')
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS files (
+            CREATE TABLE device_signed_prekeys (
+                user_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                spk_id INTEGER NOT NULL,
+                public_key TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, device_id),
+                FOREIGN KEY (user_id, device_id) REFERENCES devices(user_id, device_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE device_one_time_prekeys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                opk_id INTEGER NOT NULL,
+                public_key TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, device_id, opk_id),
+                FOREIGN KEY (user_id, device_id) REFERENCES devices(user_id, device_id)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dopk_owner ON device_one_time_prekeys (user_id, device_id)')
+        cursor.execute('''
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_group_id TEXT NOT NULL,
+                sender_user_id INTEGER NOT NULL,
+                sender_login TEXT NOT NULL,
+                sender_device_id TEXT NOT NULL,
+                receiver_user_id INTEGER NOT NULL,
+                receiver_login TEXT NOT NULL,
+                target_device_id TEXT NOT NULL,
+                wire TEXT NOT NULL,
+                file_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                client_timestamp TEXT,
+                nonce TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_msg_recv ON messages (receiver_user_id, target_device_id, id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_msg_group ON messages (message_group_id)')
+        cursor.execute('''
+            CREATE TABLE files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_name TEXT NOT NULL,
                 file_type TEXT NOT NULL,
                 file_size INTEGER NOT NULL,
                 file_data BLOB NOT NULL,
                 thumbnail_data BLOB,
+                nonce_file TEXT NOT NULL,
+                nonce_thumbnail TEXT,
                 uploaded_by TEXT NOT NULL,
                 uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 is_image_only INTEGER DEFAULT 0,
-                encrypted_key TEXT,
-                nonce_file TEXT,
-                nonce_thumbnail TEXT,
-                is_encrypted INTEGER DEFAULT 0,
                 FOREIGN KEY (uploaded_by) REFERENCES users(login)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE archive (
+                archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                peer_user_id INTEGER NOT NULL,
+                peer_login TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                message_group_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_archive_owner ON archive (user_id, peer_user_id, archive_id)')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS contacts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,28 +277,6 @@ class Database:
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_signed_prekeys (
-                user_id INTEGER PRIMARY KEY,
-                spk_id INTEGER NOT NULL,
-                public_key TEXT NOT NULL,
-                signature TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_one_time_prekeys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                opk_id INTEGER NOT NULL,
-                public_key TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, opk_id),
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        ''')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_opk_user ON user_one_time_prekeys (user_id)')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS used_nonces (
                 nonce TEXT NOT NULL,
@@ -455,25 +493,22 @@ class Database:
         return compressed
 
     def save_file(self, file_data, file_name, file_type, uploaded_by,
-                  is_image_only=False, encrypted_key=None, nonce_file=None,
+                  nonce_file, is_image_only=False,
                   thumbnail_data=None, nonce_thumbnail=None):
         file_size = len(file_data)
         if file_size > 10 * 1024 * 1024:
             return False, "Файл слишком большой (максимум 10MB)"
-
-        is_encrypted = 1 if encrypted_key else 0
 
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO files (
                 file_name, file_type, file_size, file_data, thumbnail_data,
-                uploaded_by, is_image_only, encrypted_key, nonce_file,
-                nonce_thumbnail, is_encrypted
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                nonce_file, nonce_thumbnail, uploaded_by, is_image_only
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (file_name, file_type, file_size, file_data, thumbnail_data,
-              uploaded_by, 1 if is_image_only else 0, encrypted_key,
-              nonce_file, nonce_thumbnail, is_encrypted))
+              nonce_file, nonce_thumbnail, uploaded_by,
+              1 if is_image_only else 0))
         file_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -506,52 +541,141 @@ class Database:
         conn.close()
         return row[0] if row else None
 
-    def send_message(self, sender_login, receiver_login, text, file_id=None, client_timestamp=None, nonce=None):
+    def insert_envelope(self, message_group_id, sender_user_id, sender_login,
+                        sender_device_id, receiver_user_id, receiver_login,
+                        target_device_id, wire, file_id=None,
+                        client_timestamp=None, nonce=None):
         conn = self.get_connection()
         cursor = conn.cursor()
-        has_file = 1 if file_id else 0
         cursor.execute('''
-            INSERT INTO messages (sender_login, receiver_login, message_text, has_file, file_id, client_timestamp, nonce)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (sender_login, receiver_login, text, has_file, file_id, client_timestamp, nonce))
+            INSERT INTO messages (
+                message_group_id, sender_user_id, sender_login, sender_device_id,
+                receiver_user_id, receiver_login, target_device_id,
+                wire, file_id, client_timestamp, nonce
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (message_group_id, sender_user_id, sender_login, sender_device_id,
+              receiver_user_id, receiver_login, target_device_id,
+              wire, file_id, client_timestamp, nonce))
         msg_id = cursor.lastrowid
-        cursor.execute('''
-            SELECT id, sender_login, receiver_login, message_text, has_file, file_id, timestamp, client_timestamp, nonce
-            FROM messages WHERE id = ?
-        ''', (msg_id,))
+        cursor.execute('SELECT * FROM messages WHERE id = ?', (msg_id,))
         msg = dict(cursor.fetchone())
         conn.commit()
         conn.close()
         return msg
 
-    def get_messages(self, user_login, other_login):
+    def get_messages_for_device(self, viewer_user_id, viewer_device_id,
+                                peer_user_id, since_id=0, limit=200):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT m.*, u.username AS sender_name
+            SELECT m.*, su.username AS sender_name
             FROM messages m
-            JOIN users u ON m.sender_login = u.login
-            WHERE (m.sender_login = ? AND m.receiver_login = ?)
-               OR (m.sender_login = ? AND m.receiver_login = ?)
-            ORDER BY m.timestamp ASC
-            LIMIT 50
-        ''', (user_login, other_login, other_login, user_login))
+            JOIN users su ON m.sender_user_id = su.user_id
+            WHERE m.id > ?
+              AND m.target_device_id = ?
+              AND ((m.receiver_user_id = ? AND m.sender_user_id = ?)
+                OR (m.receiver_user_id = ? AND m.sender_user_id = ?))
+            ORDER BY m.id ASC
+            LIMIT ?
+        ''', (since_id, viewer_device_id,
+              viewer_user_id, peer_user_id,
+              peer_user_id, viewer_user_id,
+              limit))
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows] if rows else []
 
-    def get_messages_since(self, user_login, contact_login, since_id):
+    def register_device(self, user_id, device_id, device_label):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT m.*, u.username AS sender_name
-            FROM messages m
-            JOIN users u ON m.sender_login = u.login
-            WHERE ((m.sender_login = ? AND m.receiver_login = ?)
-               OR (m.sender_login = ? AND m.receiver_login = ?))
-               AND m.id > ?
-            ORDER BY m.timestamp ASC
-        ''', (user_login, contact_login, contact_login, user_login, since_id))
+            INSERT INTO devices (user_id, device_id, device_label)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, device_id) DO UPDATE SET
+                device_label = excluded.device_label,
+                last_seen_at = CURRENT_TIMESTAMP
+        ''', (user_id, device_id, device_label))
+        conn.commit()
+        conn.close()
+        return True
+
+    def touch_device(self, user_id, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE devices SET last_seen_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND device_id = ?
+        ''', (user_id, device_id))
+        conn.commit()
+        conn.close()
+
+    def list_devices_for_user(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT device_id, device_label, created_at, last_seen_at
+            FROM devices WHERE user_id = ? ORDER BY created_at ASC
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else []
+
+    def device_exists(self, user_id, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM devices WHERE user_id = ? AND device_id = ?',
+                       (user_id, device_id))
+        ok = cursor.fetchone() is not None
+        conn.close()
+        return ok
+
+    def unlink_device(self, user_id, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM device_one_time_prekeys WHERE user_id = ? AND device_id = ?',
+                       (user_id, device_id))
+        cursor.execute('DELETE FROM device_signed_prekeys WHERE user_id = ? AND device_id = ?',
+                       (user_id, device_id))
+        cursor.execute('DELETE FROM messages WHERE receiver_user_id = ? AND target_device_id = ?',
+                       (user_id, device_id))
+        cursor.execute('DELETE FROM devices WHERE user_id = ? AND device_id = ?',
+                       (user_id, device_id))
+        conn.commit()
+        conn.close()
+        return True
+
+    def archive_insert(self, user_id, peer_user_id, peer_login,
+                       ciphertext, nonce, message_group_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO archive (user_id, peer_user_id, peer_login,
+                                 ciphertext, nonce, message_group_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, peer_user_id, peer_login,
+              ciphertext, nonce, message_group_id))
+        archive_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return archive_id
+
+    def archive_fetch(self, user_id, peer_user_id=None, since_archive_id=0, limit=500):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if peer_user_id is None:
+            cursor.execute('''
+                SELECT archive_id, peer_user_id, peer_login, ciphertext, nonce,
+                       message_group_id, created_at
+                FROM archive WHERE user_id = ? AND archive_id > ?
+                ORDER BY archive_id ASC LIMIT ?
+            ''', (user_id, since_archive_id, limit))
+        else:
+            cursor.execute('''
+                SELECT archive_id, peer_user_id, peer_login, ciphertext, nonce,
+                       message_group_id, created_at
+                FROM archive WHERE user_id = ? AND peer_user_id = ? AND archive_id > ?
+                ORDER BY archive_id ASC LIMIT ?
+            ''', (user_id, peer_user_id, since_archive_id, limit))
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows] if rows else []
@@ -703,24 +827,30 @@ class Database:
         conn.close()
         return True
 
-    def save_signed_prekey(self, user_id, spk_id, public_key, signature):
+    def save_signed_prekey(self, user_id, device_id, spk_id, public_key, signature):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO user_signed_prekeys
-                (user_id, spk_id, public_key, signature, created_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-        ''', (user_id, spk_id, public_key, signature))
+            INSERT INTO device_signed_prekeys
+                (user_id, device_id, spk_id, public_key, signature, created_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(user_id, device_id) DO UPDATE SET
+                spk_id = excluded.spk_id,
+                public_key = excluded.public_key,
+                signature = excluded.signature,
+                created_at = excluded.created_at
+        ''', (user_id, device_id, spk_id, public_key, signature))
         conn.commit()
         conn.close()
         return True
 
-    def get_signed_prekey(self, user_id):
+    def get_signed_prekey(self, user_id, device_id):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            'SELECT spk_id, public_key, signature FROM user_signed_prekeys WHERE user_id = ?',
-            (user_id,),
+            'SELECT spk_id, public_key, signature FROM device_signed_prekeys '
+            'WHERE user_id = ? AND device_id = ?',
+            (user_id, device_id),
         )
         row = cursor.fetchone()
         conn.close()
@@ -728,7 +858,7 @@ class Database:
             return {'spk_id': row[0], 'public_key': row[1], 'signature': row[2]}
         return None
 
-    def save_one_time_prekeys(self, user_id, prekeys):
+    def save_one_time_prekeys(self, user_id, device_id, prekeys):
         if not prekeys:
             return 0
         conn = self.get_connection()
@@ -737,9 +867,9 @@ class Database:
         for opk_id, pub in prekeys:
             try:
                 cursor.execute('''
-                    INSERT INTO user_one_time_prekeys (user_id, opk_id, public_key)
-                    VALUES (?, ?, ?)
-                ''', (user_id, opk_id, pub))
+                    INSERT INTO device_one_time_prekeys (user_id, device_id, opk_id, public_key)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, device_id, opk_id, pub))
                 inserted += 1
             except sqlite3.IntegrityError:
                 continue
@@ -747,35 +877,35 @@ class Database:
         conn.close()
         return inserted
 
-    def take_one_time_prekey(self, user_id):
+    def take_one_time_prekey(self, user_id, device_id):
         conn = self.get_connection()
         try:
             conn.execute('BEGIN IMMEDIATE')
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, opk_id, public_key
-                FROM user_one_time_prekeys
-                WHERE user_id = ?
+                FROM device_one_time_prekeys
+                WHERE user_id = ? AND device_id = ?
                 ORDER BY id ASC
                 LIMIT 1
-            ''', (user_id,))
+            ''', (user_id, device_id))
             row = cursor.fetchone()
             if not row:
                 conn.commit()
                 return None
             row_id, opk_id, pub = row[0], row[1], row[2]
-            cursor.execute('DELETE FROM user_one_time_prekeys WHERE id = ?', (row_id,))
+            cursor.execute('DELETE FROM device_one_time_prekeys WHERE id = ?', (row_id,))
             conn.commit()
             return {'opk_id': opk_id, 'public_key': pub}
         finally:
             conn.close()
 
-    def count_one_time_prekeys(self, user_id):
+    def count_one_time_prekeys(self, user_id, device_id):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            'SELECT COUNT(*) FROM user_one_time_prekeys WHERE user_id = ?',
-            (user_id,),
+            'SELECT COUNT(*) FROM device_one_time_prekeys WHERE user_id = ? AND device_id = ?',
+            (user_id, device_id),
         )
         n = cursor.fetchone()[0]
         conn.close()
@@ -1015,22 +1145,41 @@ event_queues = {}
 event_queues_lock = threading.Lock()
 
 
-def add_event(user_id, event_type, data):
+def _device_key(user_id, device_id):
+    return (int(user_id), str(device_id))
+
+
+def add_event_to_device(user_id, device_id, event_type, data):
+    key = _device_key(user_id, device_id)
     with event_queues_lock:
-        if user_id not in event_queues:
-            event_queues[user_id] = queue.Queue()
-        event_queues[user_id].put((event_type, data))
+        if key not in event_queues:
+            event_queues[key] = queue.Queue()
+        event_queues[key].put((event_type, data))
 
 
-def get_event_queue(user_id):
+def add_event_to_user_devices(user_id, event_type, data):
+    devices = db.list_devices_for_user(user_id)
+    for d in devices:
+        add_event_to_device(user_id, d['device_id'], event_type, data)
+
+
+def get_event_queue_for_device(user_id, device_id):
+    key = _device_key(user_id, device_id)
     with event_queues_lock:
-        return event_queues.get(user_id)
+        return event_queues.get(key)
 
 
-def remove_event_queue(user_id):
+def remove_event_queue_for_device(user_id, device_id):
+    key = _device_key(user_id, device_id)
     with event_queues_lock:
-        if user_id in event_queues:
-            del event_queues[user_id]
+        event_queues.pop(key, None)
+
+
+def remove_event_queues_for_user(user_id):
+    with event_queues_lock:
+        stale = [k for k in event_queues.keys() if k[0] == int(user_id)]
+        for k in stale:
+            del event_queues[k]
 
 
 def login_required(f):
@@ -1305,7 +1454,9 @@ def logout_current(user, data):
         user_token = request.headers.get('X-User-Token')
         if user_token:
             db.deactivate_session(user_token, user['user_id'])
-    remove_event_queue(user['user_id'])
+    device_id = request.headers.get('X-Device-ID')
+    if device_id:
+        remove_event_queue_for_device(user['user_id'], device_id)
     return jsonify({'success': True})
 
 
@@ -1462,8 +1613,22 @@ def opaque_login_failed():
     return jsonify({'success': True})
 
 
-MAX_VIDEO_BYTES = 1024 * 1024  # 1 MB cap for encrypted video uploads
-MAX_FILE_BYTES = 25 * 1024 * 1024  # general per-file cap
+MAX_VIDEO_BYTES = 1024 * 1024 * 1000
+MAX_FILE_BYTES = 100 * 1024 * 1024
+
+
+def _file_info_dict(file):
+    if not file:
+        return None
+    return {
+        'id': file['id'],
+        'name': file['file_name'],
+        'type': file['file_type'],
+        'size': file['file_size'],
+        'is_image_only': bool(file['is_image_only']),
+        'nonce_file': file['nonce_file'],
+        'nonce_thumbnail': file['nonce_thumbnail'],
+    }
 
 
 @app.route('/api/upload_file', methods=['POST'])
@@ -1474,13 +1639,11 @@ def upload_file(user, data):
     file_name = data.get('file_name')
     file_type = data.get('file_type')
     is_image_only = data.get('is_image_only', False)
-    encrypted_key = data.get('encrypted_key')
     nonce_file = data.get('nonce_file')
     thumbnail = data.get('thumbnail')
     nonce_thumbnail = data.get('nonce_thumbnail')
-    is_encrypted = data.get('is_encrypted', 0)
 
-    if not file_data or not file_name or not file_type:
+    if not file_data or not file_name or not file_type or not nonce_file:
         return jsonify({'success': False, 'error': 'Missing file data'})
 
     file_bytes = base64.b64decode(file_data)
@@ -1492,9 +1655,8 @@ def upload_file(user, data):
     thumb_bytes = base64.b64decode(thumbnail) if thumbnail else None
     success, result = db.save_file(
         file_bytes, file_name, file_type, user['login'],
-        is_image_only=is_image_only,
-        encrypted_key=encrypted_key,
         nonce_file=nonce_file,
+        is_image_only=is_image_only,
         thumbnail_data=thumb_bytes,
         nonce_thumbnail=nonce_thumbnail
     )
@@ -1525,8 +1687,6 @@ def get_file(user, data):
         'file_type': file['file_type'],
         'file_size': file['file_size'],
         'is_image_only': bool(file['is_image_only']),
-        'is_encrypted': bool(file['is_encrypted']),
-        'encrypted_key': file['encrypted_key'],
         'nonce_file': file['nonce_file'],
         'nonce_thumbnail': file['nonce_thumbnail']
     }
@@ -1539,126 +1699,121 @@ def get_file(user, data):
     return jsonify(response)
 
 
-@app.route('/api/upload_encrypted_file', methods=['POST'])
-@rate_limit
-@login_required
-def upload_encrypted_file(user, data):
-    encrypted_file = data.get('encrypted_file')
-    encrypted_thumbnail = data.get('encrypted_thumbnail')
-    file_name = data.get('file_name')
-    file_type = data.get('file_type')
-    file_size = data.get('file_size')
-    nonce = data.get('nonce')
-    if not encrypted_file or not file_name or not file_type:
-        return jsonify({'success': False, 'error': 'Missing file data'})
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO files (file_name, file_type, file_size, file_data, thumbnail_data, uploaded_by)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (file_name, file_type, file_size, encrypted_file, encrypted_thumbnail, user['login']))
-    file_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return jsonify({'success': True, 'file_id': file_id})
-
-
-@app.route('/api/get_encrypted_file', methods=['POST'])
-@rate_limit
-@login_required
-def get_encrypted_file(user, data):
-    file_id = data.get('file_id')
-    include_thumbnail = data.get('include_thumbnail', False)
-    if not file_id:
-        return jsonify({'success': False, 'error': 'Missing file_id'}), 400
-
-    file = db.get_file(file_id)
-    if not file:
-        return jsonify({'success': False, 'error': 'File not found'}), 404
-
-    if not file['file_data']:
-        return jsonify({'success': False, 'error': 'File data is empty'}), 500
-
-    response = {
-        'success': True,
-        'file_id': file['id'],
-        'file_name': file['file_name'],
-        'file_type': file['file_type'],
-        'file_size': file['file_size'],
-        'encrypted_file': file['file_data']
-    }
-    if include_thumbnail and file.get('thumbnail_data'):
-        response['encrypted_thumbnail'] = file['thumbnail_data']
-    return jsonify(response)
-
-
 @app.route('/api/send_message', methods=['POST'])
 @rate_limit
 @login_required
 def send_message(user, data):
+    sender_device_id = request.headers.get('X-Device-ID')
+    if not sender_device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+    if not db.device_exists(user['user_id'], sender_device_id):
+        return jsonify({'success': False, 'error': 'Sender device not registered'}), 400
+
     receiver = data.get('receiver_login')
-    text = data.get('text', '')
+    envelopes = data.get('envelopes')
     file_id = data.get('file_id')
     client_timestamp = data.get('client_timestamp')
     nonce = data.get('nonce')
+    archive_self = data.get('archive_self')
+    message_group_id = data.get('message_group_id') or str(uuid.uuid4())
 
     if not receiver:
         return jsonify({'success': False, 'error': 'Не указан получатель'})
-    if not text and not file_id:
-        return jsonify({'success': False, 'error': 'Пустое сообщение'})
-
-    if nonce and not db.mark_nonce_used(nonce, user['user_id']):
-        return jsonify({'success': False, 'error': 'Дублирующееся сообщение отклонено'}), 409
+    if not isinstance(envelopes, list) or not envelopes:
+        return jsonify({'success': False, 'error': 'Пустые envelopes'})
 
     receiver_user = db.get_user_by_login(receiver)
     if not receiver_user:
         return jsonify({'success': False, 'error': 'Получатель не найден'})
 
-    msg = db.send_message(user['login'], receiver, text, file_id, client_timestamp, nonce)
-    file_info = None
-    if file_id:
-        file = db.get_file(file_id)
-        if file:
-            file_info = {
-                'id': file['id'],
-                'name': file['file_name'],
-                'type': file['file_type'],
-                'size': file['file_size'],
-                'is_image_only': bool(file['is_image_only']),
-                'is_encrypted': bool(file['is_encrypted']),
-                'encrypted_key': file['encrypted_key'],
-                'nonce_file': file['nonce_file'],
-                'nonce_thumbnail': file['nonce_thumbnail']
-            }
-    msg_with_file = dict(msg)
-    msg_with_file['file_info'] = file_info
-    add_event(receiver_user['user_id'], 'new_message', msg_with_file)
-    return jsonify({'success': True, 'message': msg_with_file})
+    if nonce and not db.mark_nonce_used(nonce, user['user_id']):
+        return jsonify({'success': False, 'error': 'Дублирующееся сообщение отклонено'}), 409
+
+    allowed_user_ids = {user['user_id'], receiver_user['user_id']}
+    inserted = []
+    seen = set()
+    for env in envelopes:
+        if not isinstance(env, dict):
+            return jsonify({'success': False, 'error': 'envelope must be object'}), 400
+        target_user_id = env.get('target_user_id')
+        target_device_id = env.get('target_device_id')
+        wire = env.get('wire')
+        if target_user_id not in allowed_user_ids:
+            return jsonify({'success': False,
+                            'error': 'envelope target_user_id not allowed'}), 400
+        if not target_device_id or wire is None:
+            return jsonify({'success': False,
+                            'error': 'envelope missing target_device_id or wire'}), 400
+        if not db.device_exists(target_user_id, target_device_id):
+            continue
+        if (target_user_id, target_device_id) == (user['user_id'], sender_device_id):
+            continue
+        key_pair = (target_user_id, target_device_id)
+        if key_pair in seen:
+            continue
+        seen.add(key_pair)
+        target_login = (user['login'] if target_user_id == user['user_id']
+                        else receiver_user['login'])
+        wire_str = wire if isinstance(wire, str) else json.dumps(wire, separators=(',', ':'))
+        msg_row = db.insert_envelope(
+            message_group_id=message_group_id,
+            sender_user_id=user['user_id'],
+            sender_login=user['login'],
+            sender_device_id=sender_device_id,
+            receiver_user_id=target_user_id,
+            receiver_login=target_login,
+            target_device_id=target_device_id,
+            wire=wire_str,
+            file_id=file_id,
+            client_timestamp=client_timestamp,
+            nonce=nonce,
+        )
+        file_info = _file_info_dict(db.get_file(file_id)) if file_id else None
+        msg_row['file_info'] = file_info
+        inserted.append(msg_row)
+        add_event_to_device(target_user_id, target_device_id, 'new_message', msg_row)
+
+    if archive_self and isinstance(archive_self, dict):
+        ct = archive_self.get('ciphertext')
+        nn = archive_self.get('nonce')
+        if ct and nn:
+            db.archive_insert(
+                user_id=user['user_id'],
+                peer_user_id=receiver_user['user_id'],
+                peer_login=receiver_user['login'],
+                ciphertext=ct,
+                nonce=nn,
+                message_group_id=message_group_id,
+            )
+
+    return jsonify({
+        'success': True,
+        'message_group_id': message_group_id,
+        'inserted_count': len(inserted),
+        'envelopes': inserted,
+    })
 
 
 @app.route('/api/get_messages', methods=['POST'])
 @rate_limit
 @login_required
 def get_messages(user, data):
+    device_id = request.headers.get('X-Device-ID')
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
     other = data.get('other_user_login')
     if not other:
         return jsonify({'success': False, 'error': 'Не указан пользователь'})
-    messages = db.get_messages(user['login'], other)
+    other_user = db.get_user_by_login(other)
+    if not other_user:
+        return jsonify({'success': False, 'error': 'Пользователь не найден'})
+    messages = db.get_messages_for_device(
+        viewer_user_id=user['user_id'], viewer_device_id=device_id,
+        peer_user_id=other_user['user_id'], since_id=0,
+    )
     for msg in messages:
-        if msg['has_file'] and msg['file_id']:
-            file = db.get_file(msg['file_id'])
-            if file:
-                msg['file_info'] = {
-                    'id': file['id'],
-                    'name': file['file_name'],
-                    'type': file['file_type'],
-                    'size': file['file_size'],
-                    'is_image_only': bool(file['is_image_only']),
-                    'is_encrypted': bool(file['is_encrypted']),
-                    'encrypted_key': file['encrypted_key'],
-                    'nonce_file': file['nonce_file'],
-                    'nonce_thumbnail': file['nonce_thumbnail']
-                }
+        if msg.get('file_id'):
+            msg['file_info'] = _file_info_dict(db.get_file(msg['file_id']))
     return jsonify({'success': True, 'messages': messages})
 
 
@@ -1666,26 +1821,23 @@ def get_messages(user, data):
 @rate_limit
 @login_required
 def get_messages_since(user, data):
+    device_id = request.headers.get('X-Device-ID')
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
     contact_login = data.get('contact_login')
     since_id = data.get('since_id', 0)
     if not contact_login:
         return jsonify({'success': False, 'error': 'Не указан контакт'})
-    messages = db.get_messages_since(user['login'], contact_login, since_id)
+    contact = db.get_user_by_login(contact_login)
+    if not contact:
+        return jsonify({'success': False, 'error': 'Контакт не найден'})
+    messages = db.get_messages_for_device(
+        viewer_user_id=user['user_id'], viewer_device_id=device_id,
+        peer_user_id=contact['user_id'], since_id=since_id,
+    )
     for msg in messages:
-        if msg['has_file'] and msg['file_id']:
-            file = db.get_file(msg['file_id'])
-            if file:
-                msg['file_info'] = {
-                    'id': file['id'],
-                    'name': file['file_name'],
-                    'type': file['file_type'],
-                    'size': file['file_size'],
-                    'is_image_only': bool(file['is_image_only']),
-                    'is_encrypted': bool(file['is_encrypted']),
-                    'encrypted_key': file['encrypted_key'],
-                    'nonce_file': file['nonce_file'],
-                    'nonce_thumbnail': file['nonce_thumbnail']
-                }
+        if msg.get('file_id'):
+            msg['file_info'] = _file_info_dict(db.get_file(msg['file_id']))
     return jsonify({'success': True, 'messages': messages})
 
 
@@ -1722,7 +1874,7 @@ def update_profile(user, data):
         for owner in owners:
             owner_user = db.get_user_by_login(owner[0])
             if owner_user:
-                add_event(owner_user['user_id'], 'avatar_updated', {
+                add_event_to_user_devices(owner_user['user_id'], 'avatar_updated', {
                     'user_id': user['user_id'],
                     'new_version': avatar_version
                 })
@@ -1850,10 +2002,47 @@ def get_public_key(user, data):
         return jsonify({'success': False, 'error': 'Public key not found'})
 
 
+@app.route('/api/register_device', methods=['POST'])
+@rate_limit
+@login_required
+def register_device(user, data):
+    device_id = request.headers.get('X-Device-ID')
+    device_label = (data.get('device_label') or '').strip()[:100]
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+    db.register_device(user['user_id'], device_id, device_label or None)
+    return jsonify({'success': True, 'device_id': device_id})
+
+
+@app.route('/api/list_my_devices', methods=['POST'])
+@rate_limit
+@login_required
+def list_my_devices(user, data):
+    devices = db.list_devices_for_user(user['user_id'])
+    return jsonify({'success': True, 'devices': devices})
+
+
+@app.route('/api/unlink_device', methods=['POST'])
+@rate_limit
+@login_required
+def unlink_device(user, data):
+    target_device = data.get('device_id')
+    if not target_device:
+        return jsonify({'success': False, 'error': 'Не указано устройство'})
+    db.unlink_device(user['user_id'], target_device)
+    remove_event_queue_for_device(user['user_id'], target_device)
+    return jsonify({'success': True})
+
+
 @app.route('/api/upload_signed_prekey', methods=['POST'])
 @rate_limit
 @login_required
 def upload_signed_prekey(user, data):
+    device_id = request.headers.get('X-Device-ID')
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+    if not db.device_exists(user['user_id'], device_id):
+        return jsonify({'success': False, 'error': 'Device not registered'}), 400
     spk_id = data.get('spk_id')
     public_key = data.get('public_key')
     signature = data.get('signature')
@@ -1863,7 +2052,7 @@ def upload_signed_prekey(user, data):
         spk_id = int(spk_id)
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'Invalid spk_id'})
-    db.save_signed_prekey(user['user_id'], spk_id, public_key, signature)
+    db.save_signed_prekey(user['user_id'], device_id, spk_id, public_key, signature)
     return jsonify({'success': True})
 
 
@@ -1871,6 +2060,11 @@ def upload_signed_prekey(user, data):
 @rate_limit
 @login_required
 def upload_one_time_prekeys(user, data):
+    device_id = request.headers.get('X-Device-ID')
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
+    if not db.device_exists(user['user_id'], device_id):
+        return jsonify({'success': False, 'error': 'Device not registered'}), 400
     keys = data.get('prekeys')
     if not isinstance(keys, list) or not keys:
         return jsonify({'success': False, 'error': 'prekeys must be a non-empty list'})
@@ -1889,17 +2083,20 @@ def upload_one_time_prekeys(user, data):
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': 'Invalid opk_id'})
         pairs.append((opk_id_int, pub))
-    inserted = db.save_one_time_prekeys(user['user_id'], pairs)
+    inserted = db.save_one_time_prekeys(user['user_id'], device_id, pairs)
     return jsonify({'success': True, 'inserted': inserted,
-                    'total': db.count_one_time_prekeys(user['user_id'])})
+                    'total': db.count_one_time_prekeys(user['user_id'], device_id)})
 
 
 @app.route('/api/get_one_time_prekey_count', methods=['POST'])
 @rate_limit
 @login_required
 def get_one_time_prekey_count(user, data):
+    device_id = request.headers.get('X-Device-ID')
+    if not device_id:
+        return jsonify({'success': False, 'error': 'Device ID required'}), 400
     return jsonify({'success': True,
-                    'count': db.count_one_time_prekeys(user['user_id'])})
+                    'count': db.count_one_time_prekeys(user['user_id'], device_id)})
 
 
 @app.route('/api/get_prekey_bundle', methods=['POST'])
@@ -1917,10 +2114,6 @@ def get_prekey_bundle(user, data):
     if not identity:
         return jsonify({'success': False, 'error': 'Identity key not published'})
 
-    spk = db.get_signed_prekey(contact['user_id'])
-    if not spk:
-        return jsonify({'success': False, 'error': 'Signed prekey not published'})
-
     try:
         identity_bundle = json.loads(identity['public_key'])
         ik_b64 = identity_bundle['x25519']
@@ -1928,19 +2121,91 @@ def get_prekey_bundle(user, data):
     except (KeyError, ValueError):
         return jsonify({'success': False, 'error': 'Identity key bundle malformed'})
 
-    opk_row = db.take_one_time_prekey(contact['user_id'])
+    devices = db.list_devices_for_user(contact['user_id'])
+    own_device_id = request.headers.get('X-Device-ID')
 
-    bundle = {
-        'ik': ik_b64,
-        'sik': sik_b64,
-        'identity_signature': identity['signature'],
-        'spk_id': spk['spk_id'],
-        'spk': spk['public_key'],
-        'spk_signature': spk['signature'],
-        'opk_id': opk_row['opk_id'] if opk_row else None,
-        'opk': opk_row['public_key'] if opk_row else None,
-    }
-    return jsonify({'success': True, 'bundle': bundle})
+    device_bundles = []
+    for d in devices:
+        if contact['user_id'] == user['user_id'] and d['device_id'] == own_device_id:
+            continue
+        spk = db.get_signed_prekey(contact['user_id'], d['device_id'])
+        if not spk:
+            continue
+        opk_row = db.take_one_time_prekey(contact['user_id'], d['device_id'])
+        device_bundles.append({
+            'device_id': d['device_id'],
+            'device_label': d.get('device_label'),
+            'spk_id': spk['spk_id'],
+            'spk': spk['public_key'],
+            'spk_signature': spk['signature'],
+            'opk_id': opk_row['opk_id'] if opk_row else None,
+            'opk': opk_row['public_key'] if opk_row else None,
+        })
+
+    return jsonify({
+        'success': True,
+        'user_id': contact['user_id'],
+        'login': contact['login'],
+        'identity': {
+            'ik': ik_b64,
+            'sik': sik_b64,
+            'identity_signature': identity['signature'],
+        },
+        'devices': device_bundles,
+    })
+
+
+@app.route('/api/archive_upload', methods=['POST'])
+@rate_limit
+@login_required
+def archive_upload(user, data):
+    entries = data.get('entries')
+    if not isinstance(entries, list) or not entries:
+        return jsonify({'success': False, 'error': 'entries must be non-empty list'})
+    if len(entries) > 200:
+        return jsonify({'success': False, 'error': 'Too many entries in single batch'})
+    inserted_ids = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return jsonify({'success': False, 'error': 'invalid entry'})
+        peer_login = entry.get('peer_login')
+        ciphertext = entry.get('ciphertext')
+        nonce = entry.get('nonce')
+        message_group_id = entry.get('message_group_id')
+        if not peer_login or not ciphertext or not nonce:
+            return jsonify({'success': False, 'error': 'missing peer/ciphertext/nonce'})
+        peer = db.get_user_by_login(peer_login)
+        if not peer:
+            continue
+        archive_id = db.archive_insert(
+            user_id=user['user_id'],
+            peer_user_id=peer['user_id'],
+            peer_login=peer_login,
+            ciphertext=ciphertext,
+            nonce=nonce,
+            message_group_id=message_group_id,
+        )
+        inserted_ids.append(archive_id)
+    return jsonify({'success': True, 'inserted': inserted_ids})
+
+
+@app.route('/api/archive_fetch', methods=['POST'])
+@rate_limit
+@login_required
+def archive_fetch(user, data):
+    peer_login = data.get('peer_login')
+    since_archive_id = int(data.get('since_archive_id') or 0)
+    limit = int(data.get('limit') or 500)
+    limit = max(1, min(limit, 1000))
+    peer_user_id = None
+    if peer_login:
+        peer = db.get_user_by_login(peer_login)
+        if not peer:
+            return jsonify({'success': True, 'entries': []})
+        peer_user_id = peer['user_id']
+    entries = db.archive_fetch(user['user_id'], peer_user_id,
+                               since_archive_id, limit)
+    return jsonify({'success': True, 'entries': entries})
 
 
 @app.route('/api/events')
@@ -1973,12 +2238,16 @@ def events():
     if not user:
         return jsonify({'success': False, 'error': 'User not found'}), 401
     user_id = user['user_id']
-    q = get_event_queue(user_id)
+    if not db.device_exists(user_id, device_id):
+        return jsonify({'success': False, 'error': 'Device not registered'}), 400
+    db.touch_device(user_id, device_id)
+    key = _device_key(user_id, device_id)
+    q = get_event_queue_for_device(user_id, device_id)
     if q is None:
         with event_queues_lock:
-            if user_id not in event_queues:
-                event_queues[user_id] = queue.Queue()
-            q = event_queues[user_id]
+            if key not in event_queues:
+                event_queues[key] = queue.Queue()
+            q = event_queues[key]
 
     def generate():
         while True:

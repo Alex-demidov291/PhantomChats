@@ -72,10 +72,6 @@ class Bridge(QObject):
     def saveFullscreenImage(self, image_data, file_name):
         self.chat_window.save_fullscreen_image(image_data, file_name)
 
-    @pyqtSlot(str)
-    def verifyContact(self, contact_login):
-        self.chat_window.show_safety_number(contact_login)
-
 
 class MessageCache:
     def __init__(self, user_id):
@@ -251,78 +247,65 @@ class ChatWindow(QWidget):
     def fetch_contact_pubkey(self, contact):
         return
 
-    def show_safety_number(self, contact_login):
-        from chats.safety_dialog import SafetyNumberDialog
-        if not messenger_api.session_manager:
-            self._safe_run_js('showToast("E2EE не инициализирован", true);')
-            return
-        peer = messenger_api.session_manager.peer_identity(contact_login)
-        if peer is None:
-            bundle = messenger_api._fetch_prekey_bundle(contact_login)
-            if not bundle:
-                self._safe_run_js('showToast("Не удалось получить ключи контакта", true);')
-                return
-            try:
-                peer_ik = base64.b64decode(bundle['ik'])
-            except (KeyError, ValueError):
-                self._safe_run_js('showToast("Битый bundle контакта", true);')
-                return
-        else:
-            peer_ik, _peer_sik = peer
-
-        own_ik = messenger_api.identity.ik_pub_bytes
-        own_login = messenger_api.user_login or self.main_window.current_user
-        dlg = SafetyNumberDialog(own_login, contact_login, own_ik, peer_ik,
-                                 parent=self)
-        dlg.exec()
-
     def _prefetch_key_then(self, contact, callback):
         callback()
 
     def _process_e2ee_msg(self, msg, contact_login):
-        if 'decrypted_text' in msg:
+        if msg.get('decrypted_text') is not None:
             return
-
-        tekst = msg.get('message_text', '')
-        if not tekst or not isinstance(tekst, str):
+        if msg.get('archive_origin'):
+            msg['decrypted_text'] = msg.get('message_text', '')
             return
-        if not tekst.strip().startswith('{'):
+        wire_str = msg.get('wire')
+        sender_login = msg.get('sender_login')
+        sender_device_id = msg.get('sender_device_id')
+        if not wire_str or not sender_login or not sender_device_id:
+            msg['message_text'] = msg.get('message_text', '') or ''
+            msg['decrypted_text'] = msg['message_text']
             return
-
-        try:
-            data = json.loads(tekst)
-        except (ValueError, TypeError):
-            return
-        if not isinstance(data, dict):
-            return
-        if data.get('type') not in ('x3dh-init', 'ratchet'):
-            return
-
         if not messenger_api.session_manager:
             msg['message_text'] = '[E2EE не инициализирован]'
+            msg['decrypted_text'] = msg['message_text']
             return
-
         try:
-            plaintext = messenger_api.session_manager.decrypt_from(contact_login, data)
-            msg['message_text'] = plaintext.decode('utf-8', errors='replace')
+            payload = messenger_api.decrypt_incoming(msg)
         except UnknownInitialMessage:
             msg['message_text'] = '[Сессия не установлена. Попросите собеседника написать первым.]'
+            msg['decrypted_text'] = msg['message_text']
+            return
         except SessionError:
             msg['message_text'] = '[Ошибка сессии]'
+            msg['decrypted_text'] = msg['message_text']
+            return
         except Exception:
             msg['message_text'] = '[Ошибка расшифровки]'
+            msg['decrypted_text'] = msg['message_text']
+            return
+        text = payload.get('text', '') or ''
+        msg['message_text'] = text
+        msg['decrypted_text'] = text
+        if payload.get('file_meta') is not None:
+            msg['file_meta'] = payload.get('file_meta')
+        if payload.get('file_id') is not None:
+            msg['file_id'] = payload.get('file_id')
+            msg['has_file'] = 1
 
-    def _decrypt_file_bytes(self, raw_bytes, file_info, sender_login=None):
-        if not file_info or not file_info.get('is_encrypted'):
-            return raw_bytes
-        encrypted_key = file_info.get('encrypted_key')
-        nonce_file = file_info.get('nonce_file')
-        if not encrypted_key or not nonce_file or not messenger_api.session_manager:
+    def _decrypt_file_bytes(self, raw_bytes, file_info, sender_login=None,
+                            file_meta=None):
+        if not file_meta:
+            file_meta = (file_info or {}).get('file_meta')
+        if not file_meta:
             return None
         try:
-            nonce_bytes = base64.b64decode(nonce_file)
-            return messenger_api.decrypt_file_data(raw_bytes, nonce_bytes, encrypted_key,
-                                                   sender_login=sender_login)
+            file_key = base64.b64decode(file_meta['file_key'])
+            nonce_file = base64.b64decode(file_meta['nonce_file'])
+        except Exception:
+            return None
+        try:
+            return messenger_api.decrypt_file_bytes(
+                raw_bytes, nonce_file, file_key,
+                expected_sha256=file_meta.get('sha256'),
+            )
         except Exception:
             return None
 
@@ -380,6 +363,8 @@ class ChatWindow(QWidget):
         aktualnyy = self.contacts.get(contact.login, contact)
         self.cur_contact = aktualnyy
 
+        self.sync_archive_for_contact(aktualnyy)
+
         soobshenia = self.msg_cache.load_messages(aktualnyy.user_id)
         obrabotannyye = []
         for msg in soobshenia:
@@ -398,36 +383,37 @@ class ChatWindow(QWidget):
         if not receiver_login or not text:
             return
 
-        def handle_send_otvet(otvet):
-            if otvet and otvet.get('success'):
-                otpravlennoe = otvet.get('message')
-                if otpravlennoe:
-                    otpravlennoe['decrypted_text'] = text
-                    kontakt = self.contacts.get(receiver_login)
-                    if kontakt:
-                        self.msg_cache.append_messages(kontakt.user_id, [otpravlennoe])
-                    self._safe_run_js(
-                        f'appendMessage({json.dumps(self.prepare_msg_for_display(otpravlennoe))});')
-                    self._safe_run_js(
-                        'document.getElementById("messageInput").value = "";')
-                    if kontakt:
-                        self.ensure_msg_previews(kontakt.user_id, [otpravlennoe])
-            else:
-                oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
-                safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
-
         try:
-            handle_send_otvet(messenger_api.send_message(
+            otvet = messenger_api.send_message(
                 token=self.main_window.user_token,
                 user_id=self.main_window.user_id,
                 receiver_login=receiver_login,
                 text=text,
-                file_id=None
-            ))
+                file_id=None,
+                file_meta=None,
+            )
         except SessionError as exc:
             safe = html.escape(str(exc)).replace('"', '\\"').replace("'", "\\'")
             self._safe_run_js(f'showToast("E2EE: {safe}", true);')
+            return
+
+        if otvet and otvet.get('success'):
+            kontakt = self.contacts.get(receiver_login)
+            if kontakt:
+                local_msg = self._build_local_sent_msg(
+                    otvet.get('_archive_payload') or {'text': text},
+                    client_timestamp=otvet.get('_client_timestamp'),
+                    message_group_id=otvet.get('_message_group_id'),
+                )
+                self.msg_cache.append_messages(kontakt.user_id, [local_msg])
+                self._safe_run_js(
+                    f'appendMessage({json.dumps(self.prepare_msg_for_display(local_msg))});')
+                self._safe_run_js(
+                    'document.getElementById("messageInput").value = "";')
+        else:
+            oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+            safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
+            self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
 
     def attach_file(self, params_json):
         if not self.cur_contact:
@@ -448,8 +434,8 @@ class ChatWindow(QWidget):
         if not put_fayla:
             return
 
-        if os.path.getsize(put_fayla) > 10 * 1024 * 1024:
-            self._safe_run_js('showToast("Файл слишком большой (максимум 10MB)", true);')
+        if os.path.getsize(put_fayla) > 100 * 1024 * 1024:
+            self._safe_run_js('showToast("Файл слишком большой (максимум 100MB)", true);')
             return
 
         imya_fayla = os.path.basename(put_fayla)
@@ -457,19 +443,45 @@ class ChatWindow(QWidget):
         if not tip_fayla:
             tip_fayla = "application/octet-stream"
 
-        if tip_fayla.lower().startswith('video/') and os.path.getsize(put_fayla) > 1024 * 1024:
-            self._safe_run_js('showToast("Видео не должно превышать 1 MB", true);')
+        if tip_fayla.lower().startswith('video/') and os.path.getsize(put_fayla) > 1024 * 1024 * 1000:
+            self._safe_run_js('showToast("Видео не должно превышать 1000 MB", true);')
             return
 
         self._safe_run_js('showProgress(0);')
         with open(put_fayla, 'rb') as f:
             dannyye = f.read()
 
+        if not messenger_api.session_manager:
+            self._safe_run_js(
+                'showToast("E2EE не инициализирован — файл не отправлен. Перелогиньтесь.", true);'
+            )
+            return
+
+        try:
+            enc = messenger_api.encrypt_file_data(dannyye, None)
+        except SessionError as exc:
+            safe = html.escape(str(exc)).replace('"', '\\"').replace("'", "\\'")
+            self._safe_run_js(f'showToast("E2EE: {safe}", true);')
+            return
+
+        file_meta_for_wire = {
+            'file_key': enc['file_key'],
+            'nonce_file': enc['nonce_file'],
+            'sha256': enc['sha256'],
+            'name': imya_fayla,
+            'type': tip_fayla,
+            'size': len(dannyye),
+            'is_image_only': bool(tolko_kartinka),
+        }
+        if 'thumbnail' in enc:
+            file_meta_for_wire['nonce_thumbnail'] = enc['nonce_thumbnail']
+
         def handle_upload_otvet(otvet):
             self._safe_run_js('showProgress(100);')
             if otvet and otvet.get('success'):
                 self._send_msg_with_file(otvet.get('file_id'), tekst_vvoda,
-                                         imya_fayla, tip_fayla, tolko_kartinka)
+                                         imya_fayla, tip_fayla, tolko_kartinka,
+                                         file_meta_for_wire)
             else:
                 oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
                 safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
@@ -481,53 +493,87 @@ class ChatWindow(QWidget):
             'file_name': imya_fayla,
             'file_type': tip_fayla,
             'is_image_only': tolko_kartinka,
-            'session_token': self.main_window.session_token
+            'session_token': self.main_window.session_token,
+            'file_data': enc['ciphertext'],
+            'nonce_file': enc['nonce_file'],
         }
-
-        login_poluchatelya = self.cur_contact.login
-        if messenger_api.session_manager:
-            try:
-                enc = messenger_api.encrypt_file_data(dannyye, None,
-                                                      receiver_login=login_poluchatelya)
-                payload['file_data'] = enc['ciphertext']
-                payload['encrypted_key'] = enc['encrypted_key']
-                payload['nonce_file'] = enc['nonce_file']
-                payload['is_encrypted'] = 1
-            except SessionError as exc:
-                safe = html.escape(str(exc)).replace('"', '\\"').replace("'", "\\'")
-                self._safe_run_js(f'showToast("E2EE: {safe}", true);')
-                return
-        else:
-            payload['file_data'] = base64.b64encode(dannyye).decode('utf-8')
+        if 'thumbnail' in enc:
+            payload['thumbnail'] = enc['thumbnail']
+            payload['nonce_thumbnail'] = enc['nonce_thumbnail']
 
         make_server_request_async('upload_file', payload, handle_upload_otvet)
 
-    def _send_msg_with_file(self, file_id, text, file_name, file_type, is_image_only):
+    def _send_msg_with_file(self, file_id, text, file_name, file_type,
+                            is_image_only, file_meta):
         polnyy_tekst = text if text.strip() else ""
 
-        def handle_send_otvet(otvet):
-            if otvet and otvet.get('success'):
-                otpravlennoe = otvet.get('message')
-                if otpravlennoe:
-                    otpravlennoe['decrypted_text'] = polnyy_tekst
-                    self.msg_cache.append_messages(self.cur_contact.user_id, [otpravlennoe])
-                    self._safe_run_js(
-                        f'appendMessage({json.dumps(self.prepare_msg_for_display(otpravlennoe))});')
-                    self._safe_run_js(
-                        'document.getElementById("messageInput").value = "";')
-                    self.ensure_msg_previews(self.cur_contact.user_id, [otpravlennoe])
-            else:
-                oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
-                safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
-                self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
+        try:
+            otvet = messenger_api.send_message(
+                token=self.main_window.user_token,
+                user_id=self.main_window.user_id,
+                receiver_login=self.cur_contact.login,
+                text=polnyy_tekst,
+                file_id=file_id,
+                file_meta=file_meta,
+            )
+        except SessionError as exc:
+            safe = html.escape(str(exc)).replace('"', '\\"').replace("'", "\\'")
+            self._safe_run_js(f'showToast("E2EE: {safe}", true);')
+            return
 
-        handle_send_otvet(messenger_api.send_message(
-            token=self.main_window.user_token,
-            user_id=self.main_window.user_id,
-            receiver_login=self.cur_contact.login,
-            text=polnyy_tekst,
-            file_id=file_id
-        ))
+        if otvet and otvet.get('success'):
+            archive_payload = otvet.get('_archive_payload') or {}
+            local_msg = self._build_local_sent_msg(
+                archive_payload,
+                client_timestamp=otvet.get('_client_timestamp'),
+                message_group_id=otvet.get('_message_group_id'),
+                file_id=file_id,
+                file_meta=file_meta,
+                file_name=file_name, file_type=file_type,
+                is_image_only=is_image_only,
+            )
+            self.msg_cache.append_messages(self.cur_contact.user_id, [local_msg])
+            self._safe_run_js(
+                f'appendMessage({json.dumps(self.prepare_msg_for_display(local_msg))});')
+            self._safe_run_js(
+                'document.getElementById("messageInput").value = "";')
+            self.ensure_msg_previews(self.cur_contact.user_id, [local_msg])
+        else:
+            oshibka = otvet.get('error', 'Неизвестная ошибка') if otvet else 'Ошибка соединения'
+            safe_error = html.escape(oshibka).replace('"', '\\"').replace("'", "\\'")
+            self._safe_run_js(f'showToast("Ошибка: {safe_error}", true);')
+
+    def _build_local_sent_msg(self, archive_payload, client_timestamp,
+                              message_group_id, file_id=None, file_meta=None,
+                              file_name=None, file_type=None, is_image_only=False):
+        msg = {
+            'id': f'local_{message_group_id}',
+            'message_group_id': message_group_id,
+            'sender_login': self.main_window.current_user,
+            'sender_device_id': messenger_api.device_id or '',
+            'receiver_login': self.cur_contact.login,
+            'receiver_user_id': self.cur_contact.user_id,
+            'message_text': archive_payload.get('text') or '',
+            'decrypted_text': archive_payload.get('text') or '',
+            'timestamp': client_timestamp or '',
+            'client_timestamp': client_timestamp or '',
+            'has_file': 1 if file_id else 0,
+            'file_id': file_id,
+            'file_meta': file_meta,
+            'archive_origin': 'sent',
+        }
+        if file_id and file_meta:
+            msg['file_info'] = {
+                'id': file_id,
+                'name': file_name or file_meta.get('name'),
+                'type': file_type or file_meta.get('type'),
+                'size': file_meta.get('size', 0),
+                'is_image_only': bool(is_image_only),
+                'nonce_file': file_meta.get('nonce_file'),
+                'nonce_thumbnail': file_meta.get('nonce_thumbnail'),
+                'file_meta': file_meta,
+            }
+        return msg
 
     def download_file(self, file_id, file_info):
         if messenger_api.file_cache and messenger_api.file_cache.has_file(file_id):
@@ -536,14 +582,18 @@ class ChatWindow(QWidget):
                 self.save_file_dialog(file_info['name'], dannyye)
                 return
 
+        file_meta = file_info.get('file_meta') or self._lookup_file_meta(file_id)
+        if not file_meta:
+            self._safe_run_js('showToast("Нет ключа файла. Откройте чат заново.", true);')
+            return
+
         self._safe_run_js('showProgress(0);')
 
         def handle_file_otvet(otvet):
             self._safe_run_js('showProgress(100);')
             if otvet and otvet.get('success'):
                 raw = base64.b64decode(otvet.get('file_data'))
-                dannyye = self._decrypt_file_bytes(raw, file_info,
-                                                   sender_login=file_info.get('sender_login'))
+                dannyye = self._decrypt_file_bytes(raw, file_info, file_meta=file_meta)
                 if dannyye is None:
                     self._safe_run_js('showToast("Ошибка расшифровки файла", true);')
                     return
@@ -565,6 +615,13 @@ class ChatWindow(QWidget):
             'include_thumbnail': True,
             'session_token': self.main_window.session_token
         }, handle_file_otvet)
+
+    def _lookup_file_meta(self, file_id):
+        for kontakt in self.contacts.values():
+            for msg in self.msg_cache.load_messages(kontakt.user_id):
+                if msg.get('file_id') == file_id and msg.get('file_meta'):
+                    return msg.get('file_meta')
+        return None
 
     def save_file_dialog(self, file_name, dannyye):
         from PyQt6.QtCore import QCoreApplication
@@ -708,12 +765,70 @@ class ChatWindow(QWidget):
 
         kopiya = dict(message_data)
         self._process_e2ee_msg(kopiya, login_kontakta)
-        self.msg_cache.append_messages(kontakt.user_id, [message_data])
+        if kopiya.get('file_id') and not kopiya.get('file_info'):
+            kopiya['file_info'] = message_data.get('file_info') or {}
+            if kopiya['file_info'] is not None:
+                kopiya['file_info']['file_meta'] = kopiya.get('file_meta')
+        self.msg_cache.append_messages(kontakt.user_id, [kopiya])
 
         if self.cur_contact and self.cur_contact.user_id == kontakt.user_id:
             self._safe_run_js(
                 f'appendMessage({json.dumps(self.prepare_msg_for_display(kopiya))});')
-            self.ensure_msg_previews(kontakt.user_id, [message_data])
+            self.ensure_msg_previews(kontakt.user_id, [kopiya])
+
+    def sync_archive_for_contact(self, contact):
+        if not messenger_api.session_manager:
+            return
+        existing = self.msg_cache.load_messages(contact.user_id)
+        existing_groups = {m.get('message_group_id') for m in existing if m.get('message_group_id')}
+        try:
+            entries = messenger_api.archive_fetch(peer_login=contact.login)
+        except Exception:
+            entries = []
+        if not entries:
+            return
+        novyye = []
+        for entry in entries:
+            mgid = entry.get('_message_group_id') or entry.get('message_group_id')
+            if mgid and mgid in existing_groups:
+                continue
+            kind = entry.get('kind')
+            sender_login = entry.get('sender_login') or self.main_window.current_user
+            receiver_login = entry.get('receiver_login') or contact.login
+            text = entry.get('text', '') or ''
+            file_id = entry.get('file_id')
+            file_meta = entry.get('file_meta')
+            ts = entry.get('client_timestamp') or entry.get('_created_at') or ''
+            archive_id = entry.get('_archive_id', 0)
+            msg = {
+                'id': f'archive_{archive_id}',
+                'message_group_id': mgid,
+                'sender_login': sender_login,
+                'sender_device_id': entry.get('sender_device_id') or '',
+                'receiver_login': receiver_login,
+                'message_text': text,
+                'decrypted_text': text,
+                'timestamp': ts,
+                'client_timestamp': ts,
+                'has_file': 1 if file_id else 0,
+                'file_id': file_id,
+                'file_meta': file_meta,
+                'archive_origin': kind or 'archive',
+            }
+            if file_id and file_meta:
+                msg['file_info'] = {
+                    'id': file_id,
+                    'name': file_meta.get('name', 'file'),
+                    'type': file_meta.get('type', 'application/octet-stream'),
+                    'size': file_meta.get('size', 0),
+                    'is_image_only': bool(file_meta.get('is_image_only')),
+                    'nonce_file': file_meta.get('nonce_file'),
+                    'nonce_thumbnail': file_meta.get('nonce_thumbnail'),
+                    'file_meta': file_meta,
+                }
+            novyye.append(msg)
+        if novyye:
+            self.msg_cache.append_messages(contact.user_id, novyye)
 
     def on_avatar_updated(self, data):
         for kontakt in self.contacts.values():
@@ -804,6 +919,7 @@ class ChatWindow(QWidget):
 
     def sync_all_contacts(self):
         for kontakt in self.contacts.values():
+            self.sync_archive_for_contact(kontakt)
             self.sync_contact_msgs(kontakt)
         self.preload_all_imgs()
 
@@ -854,31 +970,29 @@ class ChatWindow(QWidget):
                     self._load_file_preview(file_id, msg['id'], contact_user_id)
 
     def _load_file_preview(self, file_id, message_id, contact_user_id):
+        file_meta = self._lookup_file_meta(file_id)
+        if not file_meta:
+            return
+
         def handle_otvet(otvet):
             if not otvet or not otvet.get('success'):
                 return
             raw = base64.b64decode(otvet.get('file_data'))
-            for msg in self.msg_cache.load_messages(contact_user_id):
-                if msg.get('id') == message_id and msg.get('file_info'):
-                    otpravitel = msg.get('sender_login')
-                    self._ensure_sender_key_cached(otpravitel)
-                    dannyye = self._decrypt_file_bytes(raw, msg.get('file_info'),
-                                                       sender_login=otpravitel)
-                    if dannyye is None:
-                        break
-                    prevyu = self._gen_thumbnail(dannyye)
-                    if messenger_api.file_cache:
-                        messenger_api.file_cache.save_file(
-                            file_id,
-                            msg['file_info'].get('name', 'unknown'),
-                            msg['file_info'].get('type', 'application/octet-stream'),
-                            msg['file_info'].get('size', 0),
-                            dannyye, prevyu)
-                    if prevyu:
-                        prevyu_b64 = base64.b64encode(prevyu).decode('utf-8')
-                        self._safe_run_js(
-                            f'updateMessageThumbnail({message_id}, "{prevyu_b64}");')
-                    break
+            dannyye = self._decrypt_file_bytes(raw, None, file_meta=file_meta)
+            if dannyye is None:
+                return
+            prevyu = self._gen_thumbnail(dannyye)
+            if messenger_api.file_cache:
+                messenger_api.file_cache.save_file(
+                    file_id,
+                    file_meta.get('name', 'unknown'),
+                    file_meta.get('type', 'application/octet-stream'),
+                    file_meta.get('size', 0),
+                    dannyye, prevyu)
+            if prevyu:
+                prevyu_b64 = base64.b64encode(prevyu).decode('utf-8')
+                self._safe_run_js(
+                    f'updateMessageThumbnail({json.dumps(message_id)}, "{prevyu_b64}");')
 
         make_server_request_async('get_file', {
             'user_token': self.main_window.user_token,
@@ -889,27 +1003,25 @@ class ChatWindow(QWidget):
         }, handle_otvet)
 
     def _load_file_preview_bg(self, file_id, message_id, contact_user_id):
+        file_meta = self._lookup_file_meta(file_id)
+        if not file_meta:
+            return
+
         def handle_otvet(otvet):
             if not otvet or not otvet.get('success'):
                 return
             raw = base64.b64decode(otvet.get('file_data'))
-            for msg in self.msg_cache.load_messages(contact_user_id):
-                if msg.get('id') == message_id and msg.get('file_info'):
-                    otpravitel = msg.get('sender_login')
-                    self._ensure_sender_key_cached(otpravitel)
-                    dannyye = self._decrypt_file_bytes(raw, msg.get('file_info'),
-                                                       sender_login=otpravitel)
-                    if dannyye is None:
-                        break
-                    prevyu = self._gen_thumbnail(dannyye)
-                    if messenger_api.file_cache:
-                        messenger_api.file_cache.save_file(
-                            file_id,
-                            msg['file_info'].get('name', 'unknown'),
-                            msg['file_info'].get('type', 'application/octet-stream'),
-                            msg['file_info'].get('size', 0),
-                            dannyye, prevyu)
-                    break
+            dannyye = self._decrypt_file_bytes(raw, None, file_meta=file_meta)
+            if dannyye is None:
+                return
+            prevyu = self._gen_thumbnail(dannyye)
+            if messenger_api.file_cache:
+                messenger_api.file_cache.save_file(
+                    file_id,
+                    file_meta.get('name', 'unknown'),
+                    file_meta.get('type', 'application/octet-stream'),
+                    file_meta.get('size', 0),
+                    dannyye, prevyu)
 
         make_server_request_async('get_file', {
             'user_token': self.main_window.user_token,

@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import base64
+import platform
+import uuid
 from datetime import datetime, timezone
 from PyQt6.QtCore import QSettings
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -14,13 +16,13 @@ from network.crypto import (
 from network.cryptolib import (
     IdentityKeys, PreKeyStore, SessionManager,
     UnknownInitialMessage, SessionError,
+    archive_encrypt, archive_decrypt,
 )
 from network.cryptolib.prekeys import OPK_REFILL_THRESHOLD, DEFAULT_OPK_BATCH
 from network.transport import AsyncHTTPRequest
 
 
 class MessengerAPI:
-    # -- главный api для работы с сервером
     def __init__(self, host='155.212.132.185', port=6666):
         self.network_manager = NetworkManager(host, port)
         self.file_cache = None
@@ -37,10 +39,15 @@ class MessengerAPI:
         settings = QSettings("Phantom", "Messenger")
         device_id = settings.value("device_id", "")
         if not device_id:
-            import uuid
             device_id = str(uuid.uuid4())
             settings.setValue("device_id", device_id)
         self.device_id = device_id
+
+    def _device_label(self):
+        try:
+            return f'{platform.system()} {platform.node()}'.strip()[:100] or 'device'
+        except Exception:
+            return 'device'
 
     def get_user_info(self, token, user_id, target_login):
         data = {'user_token': token, 'user_id': user_id, 'target_login': target_login}
@@ -70,11 +77,14 @@ class MessengerAPI:
         return response
 
     def init_e2ee(self, master_key):
+        if not self.device_id:
+            self.init_device_id()
         self.master_key_bytes = bytes(master_key)
         self.identity = IdentityKeys.from_master_key(self.master_key_bytes)
 
+        own_login = self.user_login or 'unknown'
         stored = SessionManager.load_prekey_store_dict(
-            self.user_login or 'unknown', self.master_key_bytes,
+            own_login, self.device_id, self.master_key_bytes,
         )
         if stored is not None:
             self.prekey_store = PreKeyStore.from_dict(stored)
@@ -82,7 +92,8 @@ class MessengerAPI:
             self.prekey_store = PreKeyStore()
 
         self.session_manager = SessionManager(
-            own_login=self.user_login or 'unknown',
+            own_login=own_login,
+            own_device_id=self.device_id,
             identity_keys=self.identity,
             prekey_store=self.prekey_store,
             master_key=self.master_key_bytes,
@@ -90,9 +101,9 @@ class MessengerAPI:
         )
 
         self._publish_identity_bundle()
+        self._register_device()
         self._ensure_signed_prekey_published()
         self._maybe_refill_one_time_prekeys()
-
         self.session_manager.save_prekey_store()
 
     def _publish_identity_bundle(self):
@@ -104,6 +115,11 @@ class MessengerAPI:
         self.network_manager.send_sync_request('publish_public_key', {
             'public_key': bundle,
             'signature': signature,
+        })
+
+    def _register_device(self):
+        self.network_manager.send_sync_request('register_device', {
+            'device_label': self._device_label(),
         })
 
     def _ensure_signed_prekey_published(self):
@@ -135,26 +151,232 @@ class MessengerAPI:
         })
         if not resp or not resp.get('success'):
             return None
-        return resp.get('bundle')
+        return {
+            'user_id': resp.get('user_id'),
+            'login': resp.get('login'),
+            'identity': resp.get('identity'),
+            'devices': resp.get('devices') or [],
+        }
 
-    def send_message(self, token, user_id, receiver_login, text='', file_id=None):
-        if self.session_manager and text:
-            wire = self.session_manager.encrypt_for(receiver_login, text)
-            text = json.dumps(wire, separators=(',', ':'))
+    def _fetch_own_other_devices_bundle(self):
+        if not self.user_login:
+            return None
+        return self._fetch_prekey_bundle(self.user_login)
+
+    def list_my_devices(self, callback=None):
+        if callback is None:
+            callback = lambda x: None
+        make_server_request_async('list_my_devices', {}, callback)
+
+    def unlink_device(self, device_id, callback=None):
+        if callback is None:
+            callback = lambda x: None
+        make_server_request_async('unlink_device', {'device_id': device_id}, callback)
+
+    def _archive_one(self, peer_login, payload, message_group_id):
+        if not self.master_key_bytes:
+            return None
+        enc = archive_encrypt(self.master_key_bytes, payload)
+        return {
+            'peer_login': peer_login,
+            'ciphertext': enc['ciphertext'],
+            'nonce': enc['nonce'],
+            'message_group_id': message_group_id,
+        }
+
+    def archive_upload_async(self, entries, callback=None):
+        if callback is None:
+            callback = lambda x: None
+        if not entries:
+            callback({'success': True})
+            return
+        make_server_request_async('archive_upload', {'entries': entries}, callback)
+
+    def archive_fetch(self, peer_login=None, since_archive_id=0):
+        data = {'since_archive_id': since_archive_id}
+        if peer_login:
+            data['peer_login'] = peer_login
+        resp = self.network_manager.send_sync_request('archive_fetch', data)
+        if not resp or not resp.get('success'):
+            return []
+        out = []
+        for entry in resp.get('entries', []):
+            try:
+                payload = archive_decrypt(self.master_key_bytes,
+                                          entry['ciphertext'], entry['nonce'])
+            except Exception:
+                continue
+            payload['_archive_id'] = entry['archive_id']
+            payload['_peer_login'] = entry['peer_login']
+            payload['_peer_user_id'] = entry['peer_user_id']
+            payload['_message_group_id'] = entry.get('message_group_id')
+            payload['_created_at'] = entry.get('created_at')
+            out.append(payload)
+        return out
+
+    def encrypt_file_data(self, file_data, thumbnail_data):
+        if not self.session_manager:
+            raise SessionError('Session manager not initialised')
+        file_key = os.urandom(32)
+        nonce_file = os.urandom(12)
+        aesgcm = AESGCM(file_key)
+        ciphertext = aesgcm.encrypt(nonce_file, file_data, None)
+        result = {
+            'file_key': base64.b64encode(file_key).decode('utf-8'),
+            'nonce_file': base64.b64encode(nonce_file).decode('utf-8'),
+            'sha256': hashlib.sha256(file_data).hexdigest(),
+            'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+        }
+        if thumbnail_data:
+            nonce_thumb = os.urandom(12)
+            thumb_cipher = aesgcm.encrypt(nonce_thumb, thumbnail_data, None)
+            result['thumbnail'] = base64.b64encode(thumb_cipher).decode('utf-8')
+            result['nonce_thumbnail'] = base64.b64encode(nonce_thumb).decode('utf-8')
+        return result
+
+    def decrypt_file_bytes(self, ciphertext, nonce, file_key, expected_sha256=None):
+        plaintext = AESGCM(file_key).decrypt(nonce, ciphertext, None)
+        if expected_sha256 and hashlib.sha256(plaintext).hexdigest() != expected_sha256:
+            raise SessionError('file integrity check failed')
+        return plaintext
+
+    def upload_file(self, token, user_id, file_data_b64, file_name, file_type,
+                    nonce_file_b64, is_image_only=False,
+                    thumbnail_b64=None, nonce_thumbnail_b64=None):
+        data = {
+            'user_token': token,
+            'user_id': user_id,
+            'file_data': file_data_b64,
+            'file_name': file_name,
+            'file_type': file_type,
+            'is_image_only': is_image_only,
+            'nonce_file': nonce_file_b64,
+        }
+        if thumbnail_b64:
+            data['thumbnail'] = thumbnail_b64
+        if nonce_thumbnail_b64:
+            data['nonce_thumbnail'] = nonce_thumbnail_b64
+        if self.network_manager.session_token:
+            data['session_token'] = self.network_manager.session_token
+        return self.network_manager.send_sync_request('upload_file', data)
+
+    def get_file(self, token, user_id, file_id, include_data=True, include_thumbnail=False):
+        data = {
+            'user_token': token,
+            'user_id': user_id,
+            'file_id': file_id,
+            'include_data': include_data,
+            'include_thumbnail': include_thumbnail
+        }
+        if self.network_manager.session_token:
+            data['session_token'] = self.network_manager.session_token
+        return self.network_manager.send_sync_request('get_file', data)
+
+    def send_message(self, token, user_id, receiver_login, text='', file_id=None,
+                     file_meta=None):
+        if not self.session_manager:
+            raise SessionError(
+                'E2EE не инициализирован — сообщение не отправлено. '
+                'Перелогиньтесь, чтобы восстановить шифрование.'
+            )
+        if not text and not file_id:
+            raise SessionError('Empty message')
+
+        peer_bundle = self._fetch_prekey_bundle(receiver_login)
+        if not peer_bundle or not peer_bundle.get('devices'):
+            raise SessionError(
+                f"can't send to {receiver_login}: no devices registered")
+
+        own_bundle = self._fetch_own_other_devices_bundle()
+
+        payload = {'text': text or ''}
+        if file_id is not None and file_meta is not None:
+            payload['file_id'] = file_id
+            payload['file_meta'] = file_meta
+
+        plaintext_bytes = json.dumps(payload, separators=(',', ':'),
+                                     ensure_ascii=False).encode('utf-8')
+
+        envelopes = self.session_manager.fan_out_encrypt(
+            peer_login=receiver_login,
+            plaintext=plaintext_bytes,
+            peer_user_bundle=peer_bundle,
+            own_other_devices_bundle=own_bundle,
+        )
+
+        if not envelopes:
+            raise SessionError('No reachable target devices')
+
+        message_group_id = str(uuid.uuid4())
         client_timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
         nonce = os.urandom(8).hex()
+
+        archive_payload = {
+            'kind': 'sent',
+            'sender_login': self.user_login,
+            'sender_device_id': self.device_id,
+            'receiver_login': receiver_login,
+            'text': text or '',
+            'file_id': file_id,
+            'file_meta': file_meta,
+            'client_timestamp': client_timestamp,
+        }
+        archive_self = self._archive_one(receiver_login, archive_payload, message_group_id)
+
         data = {
             'user_token': token,
             'user_id': user_id,
             'receiver_login': receiver_login,
-            'text': text,
+            'envelopes': envelopes,
             'file_id': file_id,
             'client_timestamp': client_timestamp,
-            'nonce': nonce
+            'nonce': nonce,
+            'message_group_id': message_group_id,
+            'archive_self': archive_self,
         }
         if self.network_manager.session_token:
             data['session_token'] = self.network_manager.session_token
-        return self.network_manager.send_sync_request('send_message', data)
+        resp = self.network_manager.send_sync_request('send_message', data)
+        if isinstance(resp, dict):
+            resp['_archive_payload'] = archive_payload
+            resp['_message_group_id'] = message_group_id
+            resp['_client_timestamp'] = client_timestamp
+        return resp
+
+    def decrypt_incoming(self, msg):
+        if not self.session_manager:
+            raise SessionError('Session manager not initialised')
+        sender_login = msg.get('sender_login')
+        sender_device_id = msg.get('sender_device_id')
+        wire_str = msg.get('wire')
+        if not sender_login or not sender_device_id or not wire_str:
+            raise SessionError('incoming message missing fields')
+        wire = json.loads(wire_str) if isinstance(wire_str, str) else wire_str
+        plaintext = self.session_manager.decrypt_from_device(
+            sender_login, sender_device_id, wire,
+        )
+        try:
+            payload = json.loads(plaintext.decode('utf-8'))
+        except Exception:
+            payload = {'text': plaintext.decode('utf-8', errors='replace')}
+        peer_login = (msg.get('receiver_login') if sender_login == self.user_login
+                      else sender_login)
+        archive_payload = {
+            'kind': 'received' if sender_login != self.user_login else 'sync',
+            'sender_login': sender_login,
+            'sender_device_id': sender_device_id,
+            'receiver_login': msg.get('receiver_login'),
+            'text': payload.get('text', ''),
+            'file_id': payload.get('file_id'),
+            'file_meta': payload.get('file_meta'),
+            'client_timestamp': msg.get('client_timestamp'),
+            'message_group_id': msg.get('message_group_id'),
+        }
+        message_group_id = msg.get('message_group_id') or str(uuid.uuid4())
+        archive_entry = self._archive_one(peer_login, archive_payload, message_group_id)
+        if archive_entry:
+            self.archive_upload_async([archive_entry])
+        return payload
 
     def get_messages(self, token, user_id, other_user_login):
         data = {'user_token': token, 'user_id': user_id, 'other_user_login': other_user_login}
@@ -212,91 +434,6 @@ class MessengerAPI:
         if self.network_manager.session_token:
             data['session_token'] = self.network_manager.session_token
         return self.network_manager.send_sync_request('set_cleanup_interval', data)
-
-    def encrypt_file_data(self, file_data, thumbnail_data, receiver_login=None):
-        if not self.session_manager:
-            raise SessionError('Session manager not initialised')
-        if not receiver_login:
-            raise SessionError('receiver_login required for file encryption')
-
-        file_key = os.urandom(32)
-        nonce_file = os.urandom(12)
-        aesgcm = AESGCM(file_key)
-        ciphertext = aesgcm.encrypt(nonce_file, file_data, None)
-
-        wrapper = json.dumps({
-            'k': base64.b64encode(file_key).decode(),
-            'n': base64.b64encode(nonce_file).decode(),
-            'h': hashlib.sha256(file_data).hexdigest(),
-        }, separators=(',', ':')).encode('utf-8')
-
-        wire = self.session_manager.encrypt_for(receiver_login, wrapper)
-
-        result = {
-            'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
-            'nonce_file': base64.b64encode(nonce_file).decode('utf-8'),
-            'encrypted_key': json.dumps(wire, separators=(',', ':')),
-        }
-
-        if thumbnail_data:
-            nonce_thumb = os.urandom(12)
-            thumb_cipher = aesgcm.encrypt(nonce_thumb, thumbnail_data, None)
-            result['thumbnail'] = base64.b64encode(thumb_cipher).decode('utf-8')
-            result['nonce_thumbnail'] = base64.b64encode(nonce_thumb).decode('utf-8')
-
-        return result
-
-    def decrypt_file_data(self, ciphertext, nonce, encrypted_key, sender_login=None):
-        if not self.session_manager:
-            raise SessionError('Session manager not initialised')
-        if not sender_login:
-            raise SessionError('sender_login required for file decryption')
-
-        wire = json.loads(encrypted_key)
-        wrapper_bytes = self.session_manager.decrypt_from(sender_login, wire)
-        wrapper = json.loads(wrapper_bytes.decode('utf-8'))
-        file_key = base64.b64decode(wrapper['k'])
-        plaintext = AESGCM(file_key).decrypt(nonce, ciphertext, None)
-        # Integrity check via end-to-end SHA-256.
-        if hashlib.sha256(plaintext).hexdigest() != wrapper.get('h'):
-            raise SessionError('file integrity check failed')
-        return plaintext
-
-    def upload_file(self, token, user_id, file_data, file_name, file_type,
-                    is_image_only=False, encrypted_key=None, nonce_file=None,
-                    thumbnail=None, nonce_thumbnail=None):
-        data = {
-            'user_token': token,
-            'user_id': user_id,
-            'file_data': file_data,
-            'file_name': file_name,
-            'file_type': file_type,
-            'is_image_only': is_image_only
-        }
-        if encrypted_key:
-            data['encrypted_key'] = encrypted_key
-            data['nonce_file'] = nonce_file
-            data['is_encrypted'] = 1
-        if thumbnail:
-            data['thumbnail'] = thumbnail
-        if nonce_thumbnail:
-            data['nonce_thumbnail'] = nonce_thumbnail
-
-        if self.network_manager.session_token:
-            data['session_token'] = self.network_manager.session_token
-        return self.network_manager.send_sync_request('upload_file', data)
-
-    def get_file(self, token, user_id, file_id, include_data=True, include_thumbnail=False):
-        data = {
-            'user_token': token,
-            'user_id': user_id,
-            'file_id': file_id,
-            'include_data': include_data,
-            'include_thumbnail': include_thumbnail
-        }
-        if self.network_manager.session_token:
-            data['session_token'] = self.network_manager.session_token
-        return self.network_manager.send_sync_request('get_file', data)
 
     def update_profile(self, token, user_id, username=None, avatar=None):
         data = {'user_token': token, 'user_id': user_id}
@@ -364,11 +501,9 @@ class MessengerAPI:
         if not response or not response.get('success'):
             callback(response)
             return
-
         client_reg_start = opaque_ke_py.client_registration_start(password.encode('utf-8'))
         registration_request = client_reg_start.get_message()
         client_reg_state = client_reg_start.get_state()
-
         make_server_request_async('opaque/register/finish', {
             'login': login,
             'username': username,
@@ -379,16 +514,13 @@ class MessengerAPI:
         if not response or not response.get('success'):
             callback(response)
             return
-
         server_response = base64.b64decode(response['server_response'])
         client_reg_finish = opaque_ke_py.client_registration_finish(password.encode('utf-8'), client_reg_state,
                                                                     server_response)
         registration_upload = client_reg_finish.get_message()
-
         master_key = gen_msg_master_key()
         encrypted = encrypt_master_key(master_key, password)
         encrypted_master_key = json.dumps(encrypted)
-
         make_server_request_async('opaque/register/upload', {
             'login': login,
             'username': username,
@@ -398,20 +530,11 @@ class MessengerAPI:
 
     def _handle_register_upload(self, login, username, password, master_key, callback, response):
         if response and response.get('success'):
-            user_id = response['user_id']
-            # Stamp the login *before* init_e2ee so the prekey store is
-            # saved under DATA_PATH/crypto/<login>/ instead of /unknown/.
-            # (The server-publish calls inside init_e2ee will still fail
-            # with 401 because we have no session token yet — they're
-            # redone at login time, when credentials are present.)
             self.user_login = login
             try:
                 self.init_e2ee(master_key)
             except Exception as exc:
-                # Don't strand the UI in a loading state if a publish
-                # endpoint is missing/misbehaving — registration itself
-                # already succeeded server-side.
-                print(f'init_e2ee failed during register: {exc}')
+                print(f'init_e2ee failed during register: {type(exc).__name__}: {exc}')
             callback(response)
         else:
             callback(response)
@@ -428,15 +551,13 @@ class MessengerAPI:
             self.network_manager.stop_event_listener()
             callback(response)
             return
-
         state_id = response['state_id']
         credential_response = base64.b64decode(response['credential_response'])
-
         try:
             client_login_finish = opaque_ke_py.client_login_finish(password.encode('utf-8'), client_login_state,
                                                                    credential_response)
             credential_finalization = client_login_finish.get_message()
-        except Exception as e:
+        except Exception:
             def handle_failed_response(failed_response):
                 self.login_in_progress = False
                 self.network_manager.stop_event_listener()
@@ -448,7 +569,6 @@ class MessengerAPI:
                 'login': login
             }, handle_failed_response)
             return
-
         make_server_request_async('opaque/login/finish', {
             'state_id': state_id,
             'credential_finalization': base64.b64encode(credential_finalization).decode('utf-8')
@@ -465,9 +585,7 @@ class MessengerAPI:
                     master_key = decrypt_master_key(encrypted, password)
                     self.init_e2ee(master_key)
                 except Exception as exc:
-                    # Do NOT propagate — UI must always get the callback,
-                    # otherwise the loading spinner becomes terminal.
-                    print(f'init_e2ee failed during login: {exc}')
+                    print(f'init_e2ee failed during login: {type(exc).__name__}: {exc}')
             self.network_manager.start_event_listener()
             self.login_in_progress = False
             callback(response)
@@ -480,11 +598,9 @@ class MessengerAPI:
             callback({'success': False, 'error': 'Логин уже выполняется'})
             return
         self.login_in_progress = True
-
         client_login_start = opaque_ke_py.client_login_start(password.encode('utf-8'))
         credential_request = client_login_start.get_message()
         client_login_state = client_login_start.get_state()
-
         make_server_request_async('opaque/login/start', {
             'login': login,
             'credential_request': base64.b64encode(credential_request).decode('utf-8')
@@ -494,16 +610,13 @@ class MessengerAPI:
         if not response or not response.get('success'):
             callback(response)
             return
-
         server_response = base64.b64decode(response['server_response'])
         client_reg_finish = opaque_ke_py.client_registration_finish(new_password.encode('utf-8'), client_reg_state,
                                                                     server_response)
         registration_upload = client_reg_finish.get_message()
-
         master_key = self.master_key_bytes
         encrypted_new = encrypt_master_key(master_key, new_password)
         encrypted_master_key_new = json.dumps(encrypted_new)
-
         make_server_request_async('opaque/change_password/upload', {
             'registration_upload': base64.b64encode(registration_upload).decode('utf-8'),
             'encrypted_master_key': encrypted_master_key_new
@@ -519,11 +632,9 @@ class MessengerAPI:
         if not self.master_key_bytes:
             callback({'success': False, 'error': 'E2EE не инициализирован'})
             return
-
         client_reg_start = opaque_ke_py.client_registration_start(new_password.encode('utf-8'))
         client_reg_state = client_reg_start.get_state()
         registration_request = client_reg_start.get_message()
-
         make_server_request_async('opaque/change_password/get_server_response', {
             'registration_request': base64.b64encode(registration_request).decode('utf-8')
         }, lambda resp: self._handle_change_password_server_response(new_password, client_reg_state, callback, resp))
@@ -533,12 +644,10 @@ messenger_api = MessengerAPI()
 
 
 def make_server_request_async(endpoint, data=None, callback=None):
-    # -- асинхронный запрос
     if data is None:
         data = {}
     if callback is None:
         callback = lambda x: None
-
     payload = dict(data)
     nm = messenger_api.network_manager
     if nm.session_token and 'session_token' not in payload:
@@ -547,5 +656,4 @@ def make_server_request_async(endpoint, data=None, callback=None):
         payload['user_token'] = nm.user_token
     if nm.user_id and 'user_id' not in payload:
         payload['user_id'] = nm.user_id
-
     AsyncHTTPRequest(endpoint, payload, callback)
